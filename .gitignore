@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Credentials & local config — NEVER commit
+credentials.json
+config.local.json
+config.local.ps1
+.env
+.env.*
+
+# Jama offline caches & vector indexes (per-machine, large)
+*.db
+*.vec.db
+models/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
