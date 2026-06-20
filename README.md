@@ -23,6 +23,11 @@ only vector search needs `fastembed` + `sqlite-vec` (auto-installed on first use
   exact counts, filters, joins.
 - ⚡ **Persistent + auto-syncing cache** — full download once, then every
   query pulls only items changed since last run (seconds).
+- 🧵 **Streaming, low-memory build** — the full download is written to a
+  per-process temp DB **wave by wave** (committed and freed each batch), so peak
+  memory stays bounded (~`concurrency × page`) regardless of project size, then
+  atomically swapped into place. Concurrent downloads use distinct temp files and
+  the last atomic swap wins — no clash, no torn cache.
 - 🇨🇳 **China-first downloads + progress** — pip deps and the embedding model
   are fetched from a China mirror chosen by a **live speed test** (Tsinghua /
   Aliyun / Tencent · `hf-mirror.com`), falling back to the international source and

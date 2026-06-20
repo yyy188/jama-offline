@@ -303,25 +303,44 @@ def api_get(path, _depth=0):
     raise RuntimeError(f"GET {path} failed: {resp.status} {body.decode(errors='ignore')[:200]}")
 
 
-def get_pages(path, limit=10**9, concurrency=CONCURRENCY_DEFAULT, progress_label=None):
-    """Page 1 sequentially (learn total + warm token), then the rest concurrently. With progress_label,
-    shows a download progress bar on stderr (used for the project-items sweep)."""
+def iter_pages(path, limit=10**9, concurrency=CONCURRENCY_DEFAULT, progress_label=None):
+    """STREAMING pager: yield items WAVE by WAVE (each wave = up to `concurrency` pages fetched concurrently),
+    so the caller never holds more than ~concurrency*PAGE items at once — peak memory is bounded regardless of
+    project size. Page 1 is fetched first (to learn the total + warm the token), then the rest in waves. With
+    progress_label, shows a download progress bar on stderr. Yields a (possibly empty) list of items per wave."""
     sep = "&" if "?" in path else "?"
     first = api_get(f"{path}{sep}startAt=0&maxResults={PAGE}")
     total = int(first["meta"]["pageInfo"]["totalResults"])
     want = min(total, limit)
-    acc = list(first.get("data") or [])
     cb = _progress(progress_label, want) if (progress_label and want > PAGE) else None
+    page1 = list(first.get("data") or [])
+    first = None  # release page 1's raw response promptly; we've taken the total + data
+    done = len(page1)
     if cb:
-        cb(len(acc))
+        cb(done)
+    yield page1
+    page1 = None  # consumer has it now -> drop the generator's reference so it can be freed
     if want > PAGE:
-        starts = range(PAGE, want, PAGE)
+        starts = list(range(PAGE, want, PAGE))
         fetch = lambda s: api_get(f"{path}{sep}startAt={s}&maxResults={PAGE}").get("data") or []
         with ThreadPoolExecutor(max_workers=concurrency) as ex:
-            for d in ex.map(fetch, starts):
-                acc.extend(d)
+            for i in range(0, len(starts), concurrency):          # one wave = <= concurrency pages
+                wave = []
+                for d in ex.map(fetch, starts[i:i + concurrency]):  # bounded look-ahead -> bounded memory
+                    wave.extend(d)
+                done += len(wave)
                 if cb:
-                    cb(min(len(acc), want))
+                    cb(min(done, want))
+                yield wave
+                wave = None  # release this wave before fetching the next one
+
+
+def get_pages(path, limit=10**9, concurrency=CONCURRENCY_DEFAULT, progress_label=None):
+    """Accumulating wrapper over iter_pages: returns ALL items as one list. Use for small result sets
+    (reference data, incremental deltas); the big project sweep streams via iter_pages to bound memory."""
+    acc = []
+    for wave in iter_pages(path, limit, concurrency, progress_label):
+        acc.extend(wave)
     return acc
 
 
@@ -514,8 +533,36 @@ _MODIFIED_IDX = ITEM_COLUMNS.index("modifiedDate")  # position of modifiedDate i
 
 
 # ============================ build a project cache ============================
-def _fetch_links(items, link_cap, concurrency):
-    ids = [int(it["id"]) for it in items]
+_TMP_SEQ = 0
+
+
+def _unique_tmp(p, ext):
+    """A unique sibling temp path for an atomic build+swap. Includes the PID (+ a process-local counter), so
+    CONCURRENT downloads of the same project — each a separate process triggered by parallel queries — get
+    DISTINCT temp files and never clobber one another; the final atomic swap then picks the single winner."""
+    global _TMP_SEQ
+    _TMP_SEQ += 1
+    return p.with_name(f"{p.stem}.tmp-{os.getpid()}-{_TMP_SEQ}.{ext}")
+
+
+def _atomic_swap(tmp, dest, retries=8, base_delay=0.1, max_delay=2.0):
+    """os.replace(tmp -> dest) with retry/backoff. On Windows a concurrent reader can briefly hold dest and
+    make the rename fail (EACCES); retry a few times, then give up cleanly (unlink the temp, raise) rather
+    than leak it. The rename itself is atomic, so readers always see either the old or the new cache."""
+    for attempt in range(retries):
+        try:
+            os.replace(str(tmp), str(dest))
+            return
+        except OSError:
+            if attempt == retries - 1:
+                Path(tmp).unlink(missing_ok=True)
+                raise
+            time.sleep(min(max_delay, base_delay * (2 ** attempt)))
+
+
+def _fetch_links(ids, link_cap, concurrency):
+    """Fetch downstream relationships for the given item ids (collected during the streaming build)."""
+    ids = list(ids)
     if link_cap > 0:
         ids = ids[:link_cap]
 
@@ -538,25 +585,29 @@ def _fetch_links(items, link_cap, concurrency):
     return edges
 
 
-def _resolve_picklists(items, concurrency):
-    ids = {str(scalar(it.get("fields", {}).get(k)))
-           for it in items for k in ("status", "priority")
-           if str(scalar(it.get("fields", {}).get(k) or "")).isdigit()}
-    if not ids:
-        return {}, []
+def _resolve_picklists(items, concurrency, cache=None):
+    """Resolve the status/priority picklist-option ids in `items` to names. `cache` (option_id -> name) is
+    reused ACROSS streaming batches so each option is fetched only once. Returns (name_map_for_these_items,
+    new_rows) where new_rows are only the freshly-fetched picklist rows to insert (INSERT OR IGNORE)."""
+    cache = cache if cache is not None else {}
+    wanted = {str(scalar(it.get("fields", {}).get(k)))
+              for it in items for k in ("status", "priority")
+              if str(scalar(it.get("fields", {}).get(k) or "")).isdigit()}
+    new_ids = [i for i in wanted if i not in cache]
+    rows = []
+    if new_ids:
+        def fetch(opt_id):
+            try:
+                return opt_id, api_get(f"/rest/v1/picklistoptions/{opt_id}").get("data")
+            except RuntimeError:
+                return opt_id, None
 
-    def fetch(opt_id):
-        try:
-            return opt_id, api_get(f"/rest/v1/picklistoptions/{opt_id}").get("data")
-        except RuntimeError:
-            return opt_id, None
-
-    name_map, rows = {}, []
-    with ThreadPoolExecutor(max_workers=concurrency) as ex:
-        for opt_id, d in ex.map(fetch, ids):
-            if d and d.get("name"):
-                name_map[opt_id] = d["name"]
-                rows.append((d["id"], d["name"], d.get("pickList")))
+        with ThreadPoolExecutor(max_workers=concurrency) as ex:
+            for opt_id, d in ex.map(fetch, new_ids):
+                if d and d.get("name"):
+                    cache[opt_id] = d["name"]
+                    rows.append((d["id"], d["name"], d.get("pickList")))
+    name_map = {i: cache[i] for i in wanted if i in cache}  # full mapping for THIS batch (incl. cache hits)
     return name_map, rows
 
 
@@ -580,10 +631,11 @@ def _item_row(it, tkey, tname, picks):
     )
 
 
-def _rows_from_items(items, concurrency):
-    """Turn raw API items into (item_rows, kv_rows, pick_rows). Shared by full build + incremental sync."""
+def _rows_from_items(items, concurrency, pick_cache=None):
+    """Turn raw API items into (item_rows, kv_rows, pick_rows). Shared by full build + incremental sync.
+    `pick_cache` (optional) memoizes resolved picklist options across streaming batches."""
     tkey, tname = type_maps()
-    picks, pick_rows = _resolve_picklists(items, concurrency)
+    picks, pick_rows = _resolve_picklists(items, concurrency, pick_cache)
     item_rows, kv_rows = [], []
     for it in items:
         item_rows.append(_item_row(it, tkey, tname, picks))
@@ -595,35 +647,53 @@ def _rows_from_items(items, concurrency):
 
 
 def build_db(proj_id, name, with_links=False, link_cap=0, concurrency=CONCURRENCY_DEFAULT):
-    timings, t = {}, time.time()
-    items = get_pages(f"/rest/v1/abstractitems?project={proj_id}", concurrency=concurrency,
-                      progress_label=f"download {name}")
-    timings["fetch_ms"] = int((time.time() - t) * 1000)
-
-    t = time.time()
-    edges = _fetch_links(items, link_cap, concurrency) if with_links else []
-    timings["link_ms"] = int((time.time() - t) * 1000)
-
-    item_rows, kv_rows, pick_rows = _rows_from_items(items, concurrency)
-
-    t = time.time()
+    """Full download -> per-project SQLite cache, STREAMED to disk wave-by-wave (see iter_pages) so peak
+    memory stays bounded (~concurrency*PAGE items) no matter how large the project is — instead of buffering
+    the whole project in memory. Each wave's rows are inserted and COMMITTED into a per-process temp DB (so
+    SQLite never holds the whole project in its page cache either); FTS + meta are built at the end and the
+    temp is atomically swapped onto the live cache. Concurrent downloads of the same project use DISTINCT
+    temp files (PID + counter) and the last atomic swap wins (both hold equivalent data) -> no memory blowup,
+    no temp-file clash, and readers never see a torn cache. A crash/Ctrl-C just discards the temp; the
+    previous good cache stays intact."""
+    timings = {"fetch_ms": 0, "link_ms": 0, "write_ms": 0}
     p = db_path(proj_id)
-    # Build into a sibling temp file, then atomically swap it in. A crash / Ctrl-C mid-build therefore
-    # leaves the PREVIOUS good cache intact (the old code unlinked it up-front, so an interrupted
-    # rebuild destroyed the cache and left a corrupt half-written file).
-    tmp = p.with_name(f"{p.stem}.tmp-{os.getpid()}.db")
+    tmp = _unique_tmp(p, "db")
     tmp.unlink(missing_ok=True)
     con = sqlite3.connect(str(tmp))
+    pick_cache, link_ids, watermark = {}, [], ""   # pick_cache memoizes picklists across waves
+    placeholders = ",".join("?" * len(ITEM_COLUMNS))
+    item_cols = ",".join(ITEM_COLUMNS)
+    t = time.time()
     try:
         con.executescript(DDL)
-        placeholders = ",".join("?" * len(ITEM_COLUMNS))
-        con.executemany(f"INSERT INTO items({','.join(ITEM_COLUMNS)}) VALUES ({placeholders})", item_rows)
-        con.executemany("INSERT INTO fields_kv(itemId,key,value) VALUES (?,?,?)", kv_rows)
-        # populate the external-content FTS index from items (name + description + test-case steps)
+        # STREAM: one wave (<= concurrency pages) at a time; insert + commit + drop before the next wave.
+        for wave in iter_pages(f"/rest/v1/abstractitems?project={proj_id}", concurrency=concurrency,
+                               progress_label=f"download {name}"):
+            if not wave:
+                continue
+            item_rows, kv_rows, pick_rows = _rows_from_items(wave, concurrency, pick_cache)
+            # OR REPLACE: a long sweep can re-see an item that shifted pages under concurrent server edits;
+            # overwrite instead of crashing on a duplicate primary key.
+            con.executemany(f"INSERT OR REPLACE INTO items({item_cols}) VALUES ({placeholders})", item_rows)
+            con.executemany("INSERT INTO fields_kv(itemId,key,value) VALUES (?,?,?)", kv_rows)
+            if pick_rows:
+                con.executemany("INSERT OR IGNORE INTO picklist(id,name,pickList) VALUES (?,?,?)", pick_rows)
+            bw = max((r[_MODIFIED_IDX] for r in item_rows if r[_MODIFIED_IDX]), default="")
+            if bw > watermark:
+                watermark = bw
+            if with_links:
+                link_ids.extend(r[0] for r in item_rows)
+            con.commit()  # flush this wave so SQLite's page cache (and our row lists) don't accumulate
+        timings["fetch_ms"] = int((time.time() - t) * 1000)
+
+        t = time.time()
+        edges = _fetch_links(link_ids, link_cap, concurrency) if with_links else []
+        timings["link_ms"] = int((time.time() - t) * 1000)
+
+        t = time.time()
+        # build the external-content FTS index once, from the fully-populated items table
         con.execute("INSERT INTO fts(rowid, name, description, stepsText) "
                     "SELECT id, name, description, stepsText FROM items")
-        if pick_rows:
-            con.executemany("INSERT OR IGNORE INTO picklist(id,name,pickList) VALUES (?,?,?)", pick_rows)
         if edges:
             rt = reltype_map()
             con.executemany(
@@ -632,13 +702,15 @@ def build_db(proj_id, name, with_links=False, link_cap=0, concurrency=CONCURRENC
                 [(scalar(e.get("id")), scalar(e.get("fromItem")), scalar(e.get("toItem")),
                   scalar(e.get("relationshipType")), rt.get(str(e.get("relationshipType"))),
                   1 if e.get("suspect") else 0) for e in edges])
-        watermark = max((r[_MODIFIED_IDX] for r in item_rows if r[_MODIFIED_IDX]), default="")
+        n_items, n_kv, n_pick = con.execute(
+            "SELECT (SELECT COUNT(*) FROM items), (SELECT COUNT(*) FROM fields_kv), "
+            "(SELECT COUNT(*) FROM picklist)").fetchone()
         now = time.time()
         meta = {
             "project_id": str(proj_id), "project_name": name,
             "fetched_at": repr(now), "last_sync_at": repr(now), "watermark": watermark,
-            "item_count": str(len(item_rows)), "field_kv_count": str(len(kv_rows)),
-            "relationship_count": str(len(edges)), "picklist_count": str(len(pick_rows)),
+            "item_count": str(n_items), "field_kv_count": str(n_kv),
+            "relationship_count": str(len(edges)), "picklist_count": str(n_pick),
             "with_links": str(bool(with_links)),
             "engine_version": ENGINE_VERSION, "schema_version": SCHEMA_VERSION, "base_url": _cfg["BASE"],
         }
@@ -649,15 +721,11 @@ def build_db(proj_id, name, with_links=False, link_cap=0, concurrency=CONCURRENC
         tmp.unlink(missing_ok=True)  # don't leave a half-written temp behind on error/Ctrl-C
         raise
     con.close()
-    try:
-        os.replace(str(tmp), str(p))  # atomic swap onto the live cache path
-    except OSError:
-        tmp.unlink(missing_ok=True)   # swap failed (e.g. dest locked on Windows) -> don't leak the temp
-        raise
+    _atomic_swap(tmp, p)  # atomic swap onto the live cache path (retries a Windows reader-lock race)
     timings["write_ms"] = int((time.time() - t) * 1000)
 
-    return {"proj_id": proj_id, "name": name, "items": len(item_rows), "fields": len(kv_rows),
-            "links": len(edges), "picklist": len(pick_rows),
+    return {"proj_id": proj_id, "name": name, "items": n_items, "fields": n_kv,
+            "links": len(edges), "picklist": n_pick,
             "size_mb": round(p.stat().st_size / 1048576, 2), **timings}
 
 
@@ -700,7 +768,7 @@ def incremental_sync(proj_id, name, concurrency=CONCURRENCY_DEFAULT):
     ids = [r[0] for r in item_rows]
 
     t = time.time()
-    tmp = p.with_name(f"{p.stem}.tmp-{os.getpid()}.db")
+    tmp = _unique_tmp(p, "db")  # per-process temp -> concurrent syncs of the same project don't collide
     tmp.unlink(missing_ok=True)
     shutil.copy2(p, tmp)  # ~17ms for 30MB; keeps the swap atomic and the original pristine on failure
     con = sqlite3.connect(str(tmp))
@@ -728,11 +796,7 @@ def incremental_sync(proj_id, name, concurrency=CONCURRENCY_DEFAULT):
         tmp.unlink(missing_ok=True)
         raise
     con.close()
-    try:
-        os.replace(str(tmp), str(p))
-    except OSError:
-        tmp.unlink(missing_ok=True)
-        raise
+    _atomic_swap(tmp, p)
     timings["write_ms"] = int((time.time() - t) * 1000)
     timings["upserted"] = len(item_rows)
     # NOTE: vectors are refreshed separately by refresh_vectors(), which sources the changed set from the
@@ -775,7 +839,7 @@ def _apply_deletions(proj_id, deleted_ids, quiet=False):
     if not ids:
         return {"items": 0, "chunks": 0}
     p = db_path(proj_id)
-    tmp = p.with_name(f"{p.stem}.tmp-{os.getpid()}.db")
+    tmp = _unique_tmp(p, "db")
     tmp.unlink(missing_ok=True)
     shutil.copy2(p, tmp)
     con = sqlite3.connect(str(tmp))
@@ -798,11 +862,7 @@ def _apply_deletions(proj_id, deleted_ids, quiet=False):
         tmp.unlink(missing_ok=True)
         raise
     con.close()
-    try:
-        os.replace(str(tmp), str(p))
-    except OSError:
-        tmp.unlink(missing_ok=True)
-        raise
+    _atomic_swap(tmp, p)
 
     # vector index: drop the deleted items' chunks (no embedding needed -> cheap)
     chunks_removed = 0
@@ -810,7 +870,7 @@ def _apply_deletions(proj_id, deleted_ids, quiet=False):
     if state in ("ready", "stale"):
         ensure_vectors()
         vp = vec_db_path(proj_id)
-        vtmp = vp.with_name(f"{vp.stem}.tmp-{os.getpid()}.vec.db")
+        vtmp = _unique_tmp(vp, "vec.db")
         vtmp.unlink(missing_ok=True)
         shutil.copy2(vp, vtmp)
         con = _vec_connect(vtmp)
@@ -834,11 +894,7 @@ def _apply_deletions(proj_id, deleted_ids, quiet=False):
             vtmp.unlink(missing_ok=True)
             raise
         con.close()
-        try:
-            os.replace(str(vtmp), str(vp))
-        except OSError:
-            vtmp.unlink(missing_ok=True)
-            raise
+        _atomic_swap(vtmp, vp)
     return {"items": len(ids), "chunks": chunks_removed}
 
 
@@ -1344,7 +1400,7 @@ def build_vectors(proj_id, quiet=False):
     t = time.time()
     vecs = embed_corpus(texts, label="embed", quiet=False)
     p = vec_db_path(proj_id)
-    tmp = p.with_name(f"{p.stem}.tmp-{os.getpid()}.vec.db")
+    tmp = _unique_tmp(p, "vec.db")
     tmp.unlink(missing_ok=True)
     con = _vec_connect(tmp, create=True)
     try:
@@ -1363,11 +1419,7 @@ def build_vectors(proj_id, quiet=False):
         tmp.unlink(missing_ok=True)
         raise
     con.close()
-    try:
-        os.replace(str(tmp), str(p))
-    except OSError:
-        tmp.unlink(missing_ok=True)
-        raise
+    _atomic_swap(tmp, p)
     if not quiet:
         print(f"[vectors] built {len(chunk_ids)} chunk vectors ({n_items} items) in {time.time()-t:.0f}s "
               f"-> {p.name} ({p.stat().st_size/1048576:.1f} MB)")
@@ -1403,7 +1455,7 @@ def refresh_vectors(proj_id, quiet=True):
     # periodic feedback on the changed items being re-embedded; it's a short, signal-only stderr line.
     vecs = embed_corpus(texts, label=f"re-embed {len(ids)} item(s)", quiet=False)
     p = vec_db_path(proj_id)
-    tmp = p.with_name(f"{p.stem}.tmp-{os.getpid()}.vec.db")
+    tmp = _unique_tmp(p, "vec.db")
     tmp.unlink(missing_ok=True)
     shutil.copy2(p, tmp)
     con = _vec_connect(tmp)
