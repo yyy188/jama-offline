@@ -4,8 +4,8 @@ description: >-
   Fast OFFLINE search of Jama Connect (https://example.jamacloud.com). Downloads one or a FEW
   specific projects into local SQLite caches (one .db per project, persistent + auto incremental sync of
   changed items each use), then searches them
-  in milliseconds — full-text (FTS5/BM25, with stemming) and substring (LIKE), plus status, custom field,
-  and ad-hoc SQL. USE THIS WHEN: the user names a specific project (e.g. "ProjectA") and wants to find / list
+  in milliseconds — full-text (FTS5/BM25, with stemming) and substring (LIKE) over an item's name,
+  description AND test-case steps, plus status, custom field, and ad-hoc SQL. USE THIS WHEN: the user names a specific project (e.g. "ProjectA") and wants to find / list
   / count / filter / cross-reference its requirements, features, test cases, or any items — especially
   repeated queries. DO NOT USE FOR: a one-off always-live lookup, browsing the requirement tree, or
   traceability across the whole instance — use the sibling `jama-query` skill. Cross-platform
@@ -69,8 +69,9 @@ python "SKILL_DIR/jama_offline.py" query    --project 12345 --sql "SELECT typeKe
    `--max-distance`-dependent, so report it as approximate. (See "Finding data vs counting data".)
 4. **Report** the `documentKey` + `name` (+ sequence) rows back to the user.
 
-Data auto-updates: each search/query first syncs items changed since last time. Use rebuild only to also
-drop server-side deletions or force a clean snapshot: "重建 / 完全刷新 / 清掉已删项" → `rebuild --project <id>`.
+Data auto-updates: each search/query first syncs items changed since last time. To also drop server-side
+deletions: "清掉已删项" → `sync --project <id> --prune-deleted` (lightweight, keeps the cache); "重建 /
+完全刷新" → `rebuild --project <id>` (full clean re-download).
 
 ---
 
@@ -116,7 +117,7 @@ measurement** tool. Either is allowed for any goal — just know the trade-off:
 | `query --project <id> --sql "SELECT ..."` | Read-only SQL for counts/filters/joins. Auto-syncs. |
 | `status` | Show what's cached: state, last-sync, watermark, size, vector-index state. |
 | `rebuild --project <id>` | Force a clean FULL re-download (also drops deleted items). (aliases: `refresh`, `update`) |
-| `sync --project <id>` | Build/incrementally-update a cache (+ its vector index). `--no-vectors` to skip vectors. |
+| `sync --project <id>` | Build/incrementally-update a cache (+ its vector index). `--no-vectors` to skip vectors. `--prune-deleted` to also remove server-deleted items. |
 | `purge --project <id>` / `--all` | Delete cache file(s) (incl. the vector index). |
 
 Every `search`/`semantic`/`query` ALWAYS checks the cache first and syncs the latest changes before
@@ -132,12 +133,16 @@ Options use `--flag value`. Lists are comma-separated: `--keyword dock,cradle`, 
 
 `search` runs THREE legs and fuses them (RRF) into one de-duped list — you don't pick a mode. The FUSED
 output is **uncapped by default** (`--top N` to limit), but each leg feeds a bounded candidate set in:
+All three legs search an item's **name + description + test-case steps** (the authored `testCaseSteps`,
+i.e. action / expectedResult / notes).
 - **keyword (FTS5/BM25)** — ranked, stemmed (`dock` matches `docking`/`docked`). **Top ~200 by relevance**
   (a multi-word OR can BM25-match 40–70% of the corpus; the tail is noise). To enumerate EVERY item
   containing a term, that's a counting/exact-set job → use **`query`** (`WHERE name LIKE '%x%'`), not search.
 - **substring (LIKE)** — partial words / codes / fragments stemming misses (`undock`, `$89009`). **Up to ~200**, in document order.
-- **semantic (vector)** — meaning/paraphrase matches sharing no literal words. Only items with **cosine
-  similarity >= 0.70** (distance <= 0.30) by default — below that they're dropped.
+- **semantic (vector)** — meaning/paraphrase matches sharing no literal words. The index is **chunked**:
+  each item's full text (name + description + steps) is embedded in overlapping windows (no truncation),
+  so a long test case is searchable end to end; chunk hits fold back to one row per item. Only items with
+  **cosine similarity >= 0.70** (distance <= 0.30) by default — below that they're dropped.
 
 Rules:
 - `--keyword a,b` (comma = OR; `--match all` = AND) and/or `--query "natural language"` (drives the vector
@@ -199,8 +204,9 @@ are dropped, and there's no count cap (`--top N` to limit). Tune the cutoff with
 
 - **Vectors are required & auto-installed:** if `fastembed`/`sqlite-vec` are missing, the first run
   **auto-runs `pip install fastembed sqlite-vec`** (one-time) — no degraded fallback.
-- **One-time index build:** the first `search`/`semantic`/`sync`/`rebuild` embeds every item with
-  `BAAI/bge-base-en-v1.5` (768-d) → a separate `jama-proj-<id>.vec.db`. This is the slow part: **downloads
+- **One-time index build:** the first `search`/`semantic`/`sync`/`rebuild` splits every item's
+  name+description+steps into overlapping chunks and embeds each with `BAAI/bge-base-en-v1.5` (768-d) →
+  a separate `jama-proj-<id>.vec.db`. This is the slow part: **downloads
   a ~200 MB model once, then ~30–35 min for a 10k-item project on CPU** (a progress bar with %/ETA shows on
   stderr). Uses ~80% of CPU threads. After that, incremental syncs only re-embed *changed* items (seconds),
   and each query is milliseconds.
@@ -219,9 +225,11 @@ are dropped, and there's no count cap (`--top N` to limit). Tune the cutoff with
   (by `modifiedDate`) before returning — a tiny delta (~1–3 s when little changed, vs ~60 s full). Forced
   by default, so results are never stale; pass **`--offline`** to skip it and read the existing cache with
   no network/credentials (errors if no cache exists yet).
-- **Catches new + changed items. Does NOT catch server-side DELETIONS.** To drop deleted items (or force
-  a clean snapshot) → `jama_offline.py rebuild --project <id>` (full re-download). `status` shows each
-  cache's last-sync time + watermark.
+- **Catches new + changed items. Does NOT catch server-side DELETIONS by default.** Two ways to drop
+  deleted items: **`sync --project <id> --prune-deleted`** (lightweight, opt-in — keeps the cache, just
+  removes items deleted on the server from both the cache AND the vector index; cheap because it first
+  compares a single server item-count and only sweeps ids when a deletion is detected), or
+  `rebuild --project <id>` (full clean re-download). `status` shows each cache's last-sync + watermark.
 - For a guaranteed-live single lookup, use the **jama-query** skill.
 
 ---
@@ -267,21 +275,29 @@ run does only a small incremental sync (seconds) before returning.
 
 Cache (`jama-proj-<id>.db`) — SQLite, every field flattened (no JSON blob):
 - **`items`** — one row/item; common fields promoted to columns (above). `description` = HTML-stripped
-  plain text. `statusName`/`priorityName` = labels resolved from the numeric `status`/`priority` ids.
+  plain text. `stepsText` = HTML-stripped plain text of a test case's authored steps (`testCaseSteps` →
+  action / expectedResult / notes; per-run `testRunSteps` are NOT included). `statusName`/`priorityName`
+  = labels resolved from the numeric `status`/`priority` ids.
 - **`fields_kv(itemId, key, value)`** — EVERY `fields.*` entry as text, incl. custom per-type keys like
   `verifying_teams_new$89009`, `testRunSteps`. (Raw HTML of `description` is not duplicated here.)
-- **`fts`** — FTS5 external-content index over `items.name` + `items.description` (rowid = item id), used
-  by `search`. Query directly: `SELECT rowid FROM fts WHERE fts MATCH 'docking' ORDER BY bm25(fts)`.
+- **`fts`** — FTS5 external-content index over `items.name` + `items.description` + `items.stepsText`
+  (rowid = item id), used by `search`. Query: `SELECT rowid FROM fts WHERE fts MATCH 'docking' ORDER BY bm25(fts)`.
 - **`picklist(id, name, pickList)`** — id→label map (status/priority and any other option ids).
 - **`relationships(...)`** — only when synced with `--with-links` (traceability is OFF by default).
 - **`meta(key, value)`** — `last_sync_at`, `watermark` (= newest `modifiedDate` captured; the incremental
   sync's high-water mark), `fetched_at`, counts, `schema_version`, versions.
 
 Vector index (`jama-proj-<id>.vec.db`, only if `semantic` was used) — a SEPARATE SQLite file so the main
-cache stays pure-stdlib-openable. Needs the `sqlite-vec` extension to read:
-- **`vec`** — `vec0(item_id INTEGER PRIMARY KEY, embedding float[768] distance_metric=cosine)`;
-  `SELECT item_id, distance FROM vec WHERE embedding MATCH :qvec ORDER BY distance LIMIT k`.
-- **`vmeta(key, value)`** — `embed_model`, `dim`, `vec_count`, `built_at` (readable without the extension).
+cache stays pure-stdlib-openable. **Chunked**: one item → one-or-more chunks. Needs the `sqlite-vec`
+extension to read:
+- **`vec`** — `vec0(chunk_id INTEGER PRIMARY KEY, embedding float[768] distance_metric=cosine)`;
+  `SELECT chunk_id, distance FROM vec WHERE embedding MATCH :qvec ORDER BY distance LIMIT k`.
+- **`chunk_map(chunk_id, item_id)`** — folds a chunk hit back to its owning item (join on `chunk_id`,
+  then keep the nearest chunk per item).
+- **`vmeta(key, value)`** — `embed_model`, `dim`, `vec_count` (chunks), `item_count`, `built_at`,
+  `vec_watermark` (newest `modifiedDate` whose vectors are current; each `search`/`semantic` re-embeds
+  items changed past it, so the index never lags — even items a vectors-less `query` synced). Readable
+  without the extension.
 
 List a project's custom fields: `query --project <id> --sql "SELECT DISTINCT key FROM fields_kv ORDER BY key"`.
 

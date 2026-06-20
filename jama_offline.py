@@ -16,6 +16,7 @@ Commands:
     projects  --project <regex>                       resolve/list matching projects (the gate)
     sync      --project <id|name>[,..]                 create-or-incrementally-update up to 5 projects
               [--no-vectors] [--with-links] [--link-cap N]        (also builds/maintains the vector index)
+              [--prune-deleted]                          also remove server-deleted items (cache+vectors; opt-in)
     rebuild   --project <id|name>[,..]                 force a clean FULL re-download (drops deletions too)
     status    [--project <id|name>[,..]]               caches: last-sync, watermark, counts, size, vectors
     search    --project <id> --keyword a,b | --query "..."   HYBRID: FTS + LIKE + vector, RRF-fused/de-duped
@@ -52,11 +53,15 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 SKILL_DIR = Path(__file__).resolve().parent
-ENGINE_VERSION = "4.0.0-py"
+ENGINE_VERSION = "4.1.0-py"
 # v4: caches are PERSISTENT (no TTL/expiry). Each use incrementally syncs items whose modifiedDate is
 # >= the cache's watermark (= MAX(modifiedDate)), upserts them, and rebuilds the FTS index. Deletions
 # on the server are NOT tracked (only adds/changes) — use `rebuild` for a clean full re-download.
-SCHEMA_VERSION = "4"
+# v4.1 (schema 5): a test case's authored steps (testCaseSteps -> action/expectedResult/notes) are
+# extracted into items.stepsText, indexed by FTS + LIKE, and embedded into the vector index. The vector
+# index now CHUNKS each item's full text (name + description + steps) with overlap instead of truncating,
+# so long test cases are searchable end to end; chunk hits fold back to one row per item at query time.
+SCHEMA_VERSION = "5"
 MAX_PROJECTS = 5
 PAGE = 50
 # 16 is the measured sweet spot on this Jama instance for the big initial sweep (ProjectA, 201 pages /
@@ -216,8 +221,25 @@ def get_token():
         headers={"Authorization": "Basic " + auth, "Content-Type": "application/x-www-form-urlencoded"},
         method="POST",
     )
-    with urllib.request.urlopen(req, timeout=60) as r:
-        tok = json.loads(r.read())["access_token"]
+    # Retry transient network/TLS hiccups (e.g. a sandbox/proxy SSL EOF mid-handshake) with backoff, like
+    # api_get. A 4xx (e.g. 401 bad creds) is a REAL failure -> raise immediately so `login` reports it
+    # fast; only 429/5xx and connection-level errors are retried.
+    tok, last = None, None
+    for attempt in range(6):
+        try:
+            with urllib.request.urlopen(req, timeout=60) as r:
+                tok = json.loads(r.read())["access_token"]
+            break
+        except urllib.error.HTTPError as e:
+            if e.code != 429 and not (500 <= e.code < 600):
+                raise
+            last = e
+        except (urllib.error.URLError, http.client.HTTPException, OSError) as e:
+            last = e
+        if attempt < 5:
+            time.sleep(min(20, 1 + attempt * 2))
+    if tok is None:
+        raise RuntimeError(f"token fetch failed after retries: {last}")
     try:
         f.write_text(json.dumps({"token": tok, "fetched": time.time()}))
     except OSError:
@@ -428,6 +450,24 @@ def strip_html(html):
     return _WS.sub(" ", text).strip()
 
 
+def steps_text(fields):
+    """Plain-text of a test case's AUTHORED steps: each testCaseSteps entry's action / expectedResult /
+    notes, HTML-stripped and space-joined. Only `testCaseSteps` is used — `testRunSteps` (per-execution
+    copies) are ignored on purpose so we don't embed near-duplicate run text. Returns '' when absent."""
+    steps = (fields or {}).get("testCaseSteps")
+    if not isinstance(steps, (list, tuple)):
+        return ""
+    parts = []
+    for s in steps:
+        if not isinstance(s, dict):
+            continue
+        for k in ("action", "expectedResult", "notes"):
+            t = strip_html(s.get(k) or "")
+            if t:
+                parts.append(t)
+    return " ".join(parts).strip()
+
+
 # ============================ schema ============================
 DDL = """
 PRAGMA journal_mode=OFF;
@@ -437,15 +477,17 @@ CREATE TABLE items(
   itemType INTEGER, typeKey TEXT, typeName TEXT, project INTEGER,
   name TEXT, description TEXT, status TEXT, statusName TEXT, priority TEXT, priorityName TEXT,
   sequence TEXT, globalSortOrder INTEGER, parentItem INTEGER, parentProject INTEGER,
-  createdDate TEXT, modifiedDate TEXT, lastActivityDate TEXT, createdBy INTEGER, modifiedBy INTEGER
+  createdDate TEXT, modifiedDate TEXT, lastActivityDate TEXT, createdBy INTEGER, modifiedBy INTEGER,
+  stepsText TEXT
 );
 CREATE TABLE fields_kv(itemId INTEGER, key TEXT, value TEXT);
 CREATE TABLE picklist(id INTEGER PRIMARY KEY, name TEXT, pickList INTEGER);
 CREATE TABLE relationships(id INTEGER PRIMARY KEY, fromItem INTEGER, toItem INTEGER,
   relationshipType INTEGER, relTypeName TEXT, suspect INTEGER);
 CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT);
--- external-content FTS5: indexes items.name + items.description with no duplicate storage; rowid = items.id
-CREATE VIRTUAL TABLE fts USING fts5(name, description, content='items', content_rowid='id',
+-- external-content FTS5: indexes items.name + items.description + items.stepsText (test-case steps) with
+-- no duplicate storage; rowid = items.id
+CREATE VIRTUAL TABLE fts USING fts5(name, description, stepsText, content='items', content_rowid='id',
   tokenize='porter unicode61');
 CREATE INDEX idx_items_typekey ON items(typeKey);
 CREATE INDEX idx_items_itemtype ON items(itemType);
@@ -461,7 +503,8 @@ CREATE INDEX idx_rel_to ON relationships(toItem);
 ITEM_COLUMNS = ("id", "documentKey", "globalId", "itemType", "typeKey", "typeName", "project",
                 "name", "description", "status", "statusName", "priority", "priorityName",
                 "sequence", "globalSortOrder", "parentItem", "parentProject",
-                "createdDate", "modifiedDate", "lastActivityDate", "createdBy", "modifiedBy")
+                "createdDate", "modifiedDate", "lastActivityDate", "createdBy", "modifiedBy",
+                "stepsText")
 _MODIFIED_IDX = ITEM_COLUMNS.index("modifiedDate")  # position of modifiedDate in an item row tuple
 
 
@@ -528,6 +571,7 @@ def _item_row(it, tkey, tname, picks):
         scalar(par.get("item")), scalar(par.get("project")),
         it.get("createdDate"), it.get("modifiedDate"), it.get("lastActivityDate"),
         scalar(it.get("createdBy")), scalar(it.get("modifiedBy")),
+        steps_text(f),
     )
 
 
@@ -570,8 +614,9 @@ def build_db(proj_id, name, with_links=False, link_cap=0, concurrency=CONCURRENC
         placeholders = ",".join("?" * len(ITEM_COLUMNS))
         con.executemany(f"INSERT INTO items({','.join(ITEM_COLUMNS)}) VALUES ({placeholders})", item_rows)
         con.executemany("INSERT INTO fields_kv(itemId,key,value) VALUES (?,?,?)", kv_rows)
-        # populate the external-content FTS index from items
-        con.execute("INSERT INTO fts(rowid, name, description) SELECT id, name, description FROM items")
+        # populate the external-content FTS index from items (name + description + test-case steps)
+        con.execute("INSERT INTO fts(rowid, name, description, stepsText) "
+                    "SELECT id, name, description, stepsText FROM items")
         if pick_rows:
             con.executemany("INSERT OR IGNORE INTO picklist(id,name,pickList) VALUES (?,?,?)", pick_rows)
         if edges:
@@ -684,10 +729,146 @@ def incremental_sync(proj_id, name, concurrency=CONCURRENCY_DEFAULT):
         raise
     timings["write_ms"] = int((time.time() - t) * 1000)
     timings["upserted"] = len(item_rows)
-    _NAME_IDX, _DESC_IDX = ITEM_COLUMNS.index("name"), ITEM_COLUMNS.index("description")
-    changed = [(r[0], r[_NAME_IDX], r[_DESC_IDX]) for r in item_rows]  # for the vector index to re-embed
+    # NOTE: vectors are refreshed separately by refresh_vectors(), which sources the changed set from the
+    # main cache by vec_watermark — so this return intentionally carries no item list for the vector path.
     return {"proj_id": proj_id, "name": name, "upserted": len(item_rows), "watermark": new_wm,
-            "size_mb": round(p.stat().st_size / 1048576, 2), "changed_items": changed, **timings}
+            "size_mb": round(p.stat().st_size / 1048576, 2), **timings}
+
+
+# ============================ deletion reconcile (OPT-IN: prune server-side deletions) ============================
+# Incremental sync only catches adds/changes (by modifiedDate). This OPT-IN step removes items deleted on
+# the server that still linger in the cache. Performance: it must run AFTER a normal sync (so the cache holds
+# every current server item), which makes the cache a strict SUPERSET of the server -> local_count -
+# server_count == the exact number of stale (deleted) items. So a SINGLE cheap count request decides whether
+# any deletions exist; the full id sweep runs ONLY when that count says some do.
+def _batches(seq, n=500):
+    """Yield slices of <= n (keeps SQL `IN (...)` parameter lists under SQLite's limit)."""
+    for i in range(0, len(seq), n):
+        yield seq[i:i + n]
+
+
+def _server_item_count(proj_id):
+    """Current server item count for a project — one cheap request (maxResults=1, read totalResults)."""
+    d = api_get(f"/rest/v1/abstractitems?project={proj_id}&startAt=0&maxResults=1")
+    return int(d["meta"]["pageInfo"]["totalResults"])
+
+
+def _fetch_all_ids(proj_id, concurrency=CONCURRENCY_DEFAULT):
+    """All current server item ids for a project (paged sweep, concurrent). Returns a set of ints. This is
+    the only expensive part of a reconcile, so callers gate it behind the cheap count pre-check."""
+    items = get_pages(f"/rest/v1/abstractitems?project={proj_id}", concurrency=concurrency,
+                      progress_label=f"id-sweep {proj_id}")
+    return {int(it["id"]) for it in items if it.get("id") is not None}
+
+
+def _apply_deletions(proj_id, deleted_ids, quiet=False):
+    """Remove the given item ids from the main cache (items, fields_kv, relationships, FTS) AND the vector
+    index (chunks via chunk_map). Atomic copy+swap per file, so a failure leaves both caches intact.
+    Pure-local — no network — so it is unit-testable on a copied cache."""
+    ids = sorted({int(i) for i in deleted_ids})
+    if not ids:
+        return {"items": 0, "chunks": 0}
+    p = db_path(proj_id)
+    tmp = p.with_name(f"{p.stem}.tmp-{os.getpid()}.db")
+    tmp.unlink(missing_ok=True)
+    shutil.copy2(p, tmp)
+    con = sqlite3.connect(str(tmp))
+    try:
+        for batch in _batches(ids):
+            q = ",".join("?" * len(batch))
+            con.execute(f"DELETE FROM items WHERE id IN ({q})", batch)
+            con.execute(f"DELETE FROM fields_kv WHERE itemId IN ({q})", batch)
+            con.execute(f"DELETE FROM relationships WHERE fromItem IN ({q})", batch)
+            con.execute(f"DELETE FROM relationships WHERE toItem IN ({q})", batch)
+        con.execute("INSERT INTO fts(fts) VALUES('rebuild')")  # rebuild external-content FTS from items
+        ic = con.execute("SELECT COUNT(*) FROM items").fetchone()[0]
+        kc = con.execute("SELECT COUNT(*) FROM fields_kv").fetchone()[0]
+        con.executemany("INSERT OR REPLACE INTO meta(key,value) VALUES (?,?)",
+                        [("item_count", str(ic)), ("field_kv_count", str(kc)),
+                         ("last_sync_at", repr(time.time()))])
+        con.commit()
+    except BaseException:
+        con.close()
+        tmp.unlink(missing_ok=True)
+        raise
+    con.close()
+    try:
+        os.replace(str(tmp), str(p))
+    except OSError:
+        tmp.unlink(missing_ok=True)
+        raise
+
+    # vector index: drop the deleted items' chunks (no embedding needed -> cheap)
+    chunks_removed = 0
+    state, _ = vec_index_state(proj_id)
+    if state in ("ready", "stale"):
+        ensure_vectors()
+        vp = vec_db_path(proj_id)
+        vtmp = vp.with_name(f"{vp.stem}.tmp-{os.getpid()}.vec.db")
+        vtmp.unlink(missing_ok=True)
+        shutil.copy2(vp, vtmp)
+        con = _vec_connect(vtmp)
+        try:
+            for batch in _batches(ids):
+                q = ",".join("?" * len(batch))
+                cids = [r[0] for r in
+                        con.execute(f"SELECT chunk_id FROM chunk_map WHERE item_id IN ({q})", batch).fetchall()]
+                for cb in _batches(cids):
+                    cq = ",".join("?" * len(cb))
+                    con.execute(f"DELETE FROM vec WHERE chunk_id IN ({cq})", cb)
+                    con.execute(f"DELETE FROM chunk_map WHERE chunk_id IN ({cq})", cb)
+                    chunks_removed += len(cb)
+            vc = con.execute("SELECT COUNT(*) FROM vec").fetchone()[0]
+            icv = con.execute("SELECT COUNT(DISTINCT item_id) FROM chunk_map").fetchone()[0]
+            con.executemany("INSERT OR REPLACE INTO vmeta(key,value) VALUES (?,?)",
+                            [("vec_count", str(vc)), ("item_count", str(icv)), ("built_at", repr(time.time()))])
+            con.commit()
+        except BaseException:
+            con.close()
+            vtmp.unlink(missing_ok=True)
+            raise
+        con.close()
+        try:
+            os.replace(str(vtmp), str(vp))
+        except OSError:
+            vtmp.unlink(missing_ok=True)
+            raise
+    return {"items": len(ids), "chunks": chunks_removed}
+
+
+def reconcile_deletions(proj_id, name, concurrency=CONCURRENCY_DEFAULT, quiet=False):
+    """OPT-IN: remove cached items that were deleted on the server. Cheap by design — a single count request
+    decides whether a full id sweep is even needed (see section note). MUST run after a normal sync so the
+    cache is a superset of the server. Network-touching; not for --offline."""
+    p = db_path(proj_id)
+    if not p.exists():
+        if not quiet:
+            print(f"[{proj_id} {name}] no cache to reconcile.")
+        return {"deleted": 0, "method": "none"}
+    con = open_db(proj_id)
+    try:
+        local_ids = {r[0] for r in con.execute("SELECT id FROM items")}
+    finally:
+        con.close()
+    server_count = _server_item_count(proj_id)  # one cheap request
+    if len(local_ids) <= server_count:
+        if not quiet:
+            print(f"[{proj_id} {name}] no deletions to prune (local {len(local_ids)} <= server {server_count}).")
+        return {"deleted": 0, "method": "count"}
+    if not quiet:
+        print(f"[{proj_id} {name}] local {len(local_ids)} > server {server_count} -> sweeping ids to find "
+              f"{len(local_ids) - server_count} deletion(s)...")
+    server_ids = _fetch_all_ids(proj_id, concurrency)
+    deleted = local_ids - server_ids
+    if not deleted:  # count differed but every local id still exists (e.g. a concurrent add mid-sweep)
+        if not quiet:
+            print(f"[{proj_id} {name}] no stale ids after sweep; nothing pruned.")
+        return {"deleted": 0, "method": "sweep"}
+    res = _apply_deletions(proj_id, deleted, quiet=quiet)
+    if not quiet:
+        print(f"[{proj_id} {name}] pruned {res['items']} deleted item(s) "
+              f"({res['chunks']} vector chunk(s) removed).")
+    return {"deleted": res["items"], "chunks": res["chunks"], "method": "sweep"}
 
 
 # ============================ semantic / vector search (OPTIONAL: fastembed + sqlite-vec) ============================
@@ -700,7 +881,14 @@ EMBED_DIM = 768
 # bge-base attention is O(batch * 512^2); batch 64 can spike ~300MB/buffer and OOM. 16 is the safe,
 # still-fast default (compute-bound at 80% threads, not batch-overhead-bound).
 VEC_BATCH = 16
-VEC_SCHEMA = "1"
+VEC_SCHEMA = "2"  # v2: chunked index — vec is keyed by chunk_id, chunk_map folds chunk->item
+# Chunking (instead of truncating) so a long test case's full name+description+steps is embedded and
+# searchable end to end. 1500-char windows with 200-char overlap keep each chunk under bge's 512-token
+# (~2k char) limit while preserving cross-boundary context. MAX_EMBED_CHARS is a pathological safety
+# ceiling only (the largest real item here is ~31k chars, well under it) — effectively no truncation.
+CHUNK_CHARS = 1500
+CHUNK_OVERLAP = 200
+MAX_EMBED_CHARS = 50000
 VEC_MAX_DISTANCE = 0.30  # vector hits must have cosine distance <= this (i.e. cosine similarity >= 0.70)
 LEG_CANDIDATES = 200     # FTS/LIKE per-leg candidate depth fed into RRF fusion. BM25's tail is near-zero
                          # noise (multi-word OR can match 40-70% of the corpus); 200 covers the real signal
@@ -768,10 +956,56 @@ def get_embedder():
     return _embedder
 
 
-def _embed_text(name, description):
-    n, d = (name or "").strip(), (description or "").strip()
-    t = (n + ". " + d).strip(". ").strip() if d else n
-    return t[:4000]  # the model truncates at 512 tokens (~2k chars) anyway -> lossless, caps tokenizer work
+def _item_text(name, description, steps):
+    """Compose an item's full embeddable text: name, then description, then test-case steps. The name is
+    joined to the description with '. '; steps are appended with a space. No length cap here — chunking
+    (item_chunks) handles long items, so nothing is truncated."""
+    n, d, s = (name or "").strip(), (description or "").strip(), (steps or "").strip()
+    core = (n + ". " + d) if (n and d) else (n or d)
+    if s:
+        core = (core + " " + s) if core else s
+    return core.strip()
+
+
+def _chunk_text(text):
+    """Split text into overlapping windows of CHUNK_CHARS (overlap CHUNK_OVERLAP) covering it completely.
+    Short text -> a single chunk; empty -> []. Adjacent chunks share CHUNK_OVERLAP chars so a match never
+    falls in a seam."""
+    t = (text or "").strip()
+    if not t:
+        return []
+    size, overlap = CHUNK_CHARS, CHUNK_OVERLAP
+    if len(t) <= size:
+        return [t]
+    step = size - overlap
+    out, start = [], 0
+    while True:
+        out.append(t[start:start + size])
+        if start + size >= len(t):
+            break
+        start += step
+    return out
+
+
+def item_chunks(name, description, steps):
+    """Compose (name+description+steps) then chunk it. MAX_EMBED_CHARS caps only pathological items."""
+    return _chunk_text(_item_text(name, description, steps)[:MAX_EMBED_CHARS])
+
+
+def _chunk_units(rows):
+    """Expand item rows into per-chunk embedding units. Returns three parallel lists
+    (chunk_ids, item_ids, texts); chunk_id is a fresh 1-based sequence (the vec table's PK) and item_id
+    its owning item. Every item yields >= 1 chunk, so no item is dropped from the index."""
+    chunk_ids, item_ids, texts = [], [], []
+    cid = 0
+    for r in rows:
+        chunks = item_chunks(r["name"], r["description"], r["stepsText"]) or [(r["name"] or "")]
+        for c in chunks:
+            cid += 1
+            chunk_ids.append(cid)
+            item_ids.append(r["id"])
+            texts.append(c)
+    return chunk_ids, item_ids, texts
 
 
 def _vec_connect(path, create=False):
@@ -786,7 +1020,10 @@ def _vec_connect(path, create=False):
         # distance_metric=cosine -> KNN `distance` is (1 - cosine_similarity); bge vectors are
         # normalized so this ranks identically to L2 but gives an interpretable score = 1 - distance.
         con.execute(f"CREATE VIRTUAL TABLE IF NOT EXISTS vec USING vec0("
-                    f"item_id INTEGER PRIMARY KEY, embedding float[{EMBED_DIM}] distance_metric=cosine)")
+                    f"chunk_id INTEGER PRIMARY KEY, embedding float[{EMBED_DIM}] distance_metric=cosine)")
+        # chunk_map folds a chunk hit back to its owning item (one item -> many chunks)
+        con.execute("CREATE TABLE IF NOT EXISTS chunk_map(chunk_id INTEGER PRIMARY KEY, item_id INTEGER)")
+        con.execute("CREATE INDEX IF NOT EXISTS idx_chunk_item ON chunk_map(item_id)")
         con.execute("CREATE TABLE IF NOT EXISTS vmeta(key TEXT PRIMARY KEY, value TEXT)")
     return con
 
@@ -835,29 +1072,36 @@ def vec_index_state(proj_id):
             con.close()
     except sqlite3.Error:
         return "absent", {}
-    if m.get("embed_model") != EMBED_MODEL or m.get("dim") != str(EMBED_DIM):
+    if (m.get("embed_model") != EMBED_MODEL or m.get("dim") != str(EMBED_DIM)
+            or m.get("vec_schema") != VEC_SCHEMA):  # v1 (item-keyed) -> rebuild as chunked v2
         return "stale", m
     return "ready", m
 
 
 def build_vectors(proj_id, quiet=False):
-    """Full (re)build of the project's vector index from the main cache. Atomic swap; progress bar."""
+    """Full (re)build of the project's CHUNKED vector index from the main cache. Each item's full text
+    (name + description + steps) is split into overlapping chunks; every chunk is embedded and mapped
+    back to its item via chunk_map. Atomic swap; progress bar."""
     ensure_vectors()  # required: auto-installs fastembed/sqlite-vec if missing
     main = open_db(proj_id)
     try:
-        rows = main.execute("SELECT id, name, description FROM items ORDER BY id").fetchall()
+        rows = main.execute("SELECT id, name, description, stepsText FROM items ORDER BY id").fetchall()
         wmrow = main.execute("SELECT value FROM meta WHERE key='watermark'").fetchone()
     finally:
         main.close()
-    # Sort items by text length so each fixed-size batch is length-homogeneous: fastembed pads every
+    chunk_ids, item_ids, texts = _chunk_units(rows)
+    n_items = len(set(item_ids))
+    # Sort chunks by text length so each fixed-size batch is length-homogeneous: fastembed pads every
     # batch to its longest member, so mixing a 512-token monster with short docs wastes ~3x compute.
-    # Sorting cut the real ProjectA build from ~105min to ~35min. We keep ids aligned with their text.
-    pairs = sorted(((r["id"], _embed_text(r["name"], r["description"])) for r in rows), key=lambda p: len(p[1]))
-    ids = [p[0] for p in pairs]
-    texts = [p[1] for p in pairs]
+    # We keep chunk_ids + item_ids aligned with their text through the sort.
+    order = sorted(range(len(texts)), key=lambda i: len(texts[i]))
+    chunk_ids = [chunk_ids[i] for i in order]
+    item_ids = [item_ids[i] for i in order]
+    texts = [texts[i] for i in order]
     if not quiet:
-        print(f"[vectors] embedding {len(ids)} items — {EMBED_MODEL}, {embed_threads()} threads "
-              f"(one-time, ~35 min for 10k on CPU; later syncs only re-embed changed items)")
+        print(f"[vectors] embedding {len(texts)} chunks from {n_items} items — {EMBED_MODEL}, "
+              f"{embed_threads()} threads (one-time, ~35-45 min for 10k items on CPU; later syncs only "
+              f"re-embed changed items)")
     t = time.time()
     vecs = embed_corpus(texts, label="embed", quiet=quiet)
     p = vec_db_path(proj_id)
@@ -865,11 +1109,14 @@ def build_vectors(proj_id, quiet=False):
     tmp.unlink(missing_ok=True)
     con = _vec_connect(tmp, create=True)
     try:
-        con.executemany("INSERT INTO vec(item_id, embedding) VALUES (?, ?)",
-                        [(i, v.tobytes()) for i, v in zip(ids, vecs)])
-        meta = {"embed_model": EMBED_MODEL, "dim": str(EMBED_DIM), "vec_count": str(len(ids)),
-                "main_watermark": (wmrow[0] if wmrow else ""), "built_at": repr(time.time()),
-                "vec_schema": VEC_SCHEMA, "engine_version": ENGINE_VERSION}
+        con.executemany("INSERT INTO vec(chunk_id, embedding) VALUES (?, ?)",
+                        [(c, v.tobytes()) for c, v in zip(chunk_ids, vecs)])
+        con.executemany("INSERT INTO chunk_map(chunk_id, item_id) VALUES (?, ?)",
+                        list(zip(chunk_ids, item_ids)))
+        wm = (wmrow[0] if wmrow else "")
+        meta = {"embed_model": EMBED_MODEL, "dim": str(EMBED_DIM), "vec_count": str(len(chunk_ids)),
+                "item_count": str(n_items), "main_watermark": wm, "vec_watermark": wm,
+                "built_at": repr(time.time()), "vec_schema": VEC_SCHEMA, "engine_version": ENGINE_VERSION}
         con.executemany("INSERT OR REPLACE INTO vmeta(key,value) VALUES (?,?)", list(meta.items()))
         con.commit()
     except BaseException:
@@ -883,33 +1130,62 @@ def build_vectors(proj_id, quiet=False):
         tmp.unlink(missing_ok=True)
         raise
     if not quiet:
-        print(f"[vectors] built {len(ids)} vectors in {time.time()-t:.0f}s "
+        print(f"[vectors] built {len(chunk_ids)} chunk vectors ({n_items} items) in {time.time()-t:.0f}s "
               f"-> {p.name} ({p.stat().st_size/1048576:.1f} MB)")
-    return {"vec_count": len(ids), "build_s": round(time.time() - t, 1)}
+    return {"vec_count": len(chunk_ids), "item_count": n_items, "build_s": round(time.time() - t, 1)}
 
 
-def sync_vectors(proj_id, changed_items, quiet=True):
-    """Upsert embeddings for changed items into an EXISTING vec index (copy+swap). No-op if the index is
-    absent (built by sync/rebuild/semantic) or stale (model changed -> a full rebuild handles it)."""
-    if not changed_items:
-        return None
-    state, _ = vec_index_state(proj_id)
+def refresh_vectors(proj_id, quiet=True):
+    """Bring the EXISTING vec index up to date with the main cache (copy+swap). Re-embeds every item whose
+    modifiedDate is >= the index's vec_watermark, reading the text LOCALLY from the main cache (no network).
+    Sourcing the set from the main cache (not just the items the last incremental pulled) is what stops the
+    vector index drifting stale when a vectors-less command — e.g. `query` — synced changed items into the
+    main cache. No-op if the index is absent/stale (caller does a full build) or nothing changed."""
+    state, vmeta = vec_index_state(proj_id)
     if state != "ready":
         return None  # absent/stale -> the caller's build_vectors() (re)builds the whole index instead
+    wm = vmeta.get("vec_watermark") or vmeta.get("main_watermark") or ""
+    if not wm:
+        return None  # indeterminate watermark -> leave it to a full rebuild rather than re-embed everything
+    main = open_db(proj_id)
+    try:  # inclusive >= mirrors incremental_sync: catches an item written in the watermark's exact ms
+        rows = main.execute("SELECT id, name, description, stepsText FROM items WHERE modifiedDate >= ?",
+                            (wm,)).fetchall()
+        wmrow = main.execute("SELECT value FROM meta WHERE key='watermark'").fetchone()
+    finally:
+        main.close()
+    if not rows:
+        return None
+    new_wm = (wmrow[0] if wmrow else wm) or wm
     ensure_vectors()
-    ids = [it[0] for it in changed_items]
-    texts = [_embed_text(it[1], it[2]) for it in changed_items]
-    vecs = embed_corpus(texts, quiet=True)
+    ids = sorted({r["id"] for r in rows})
+    cids, iids, texts = _chunk_units(rows)
+    vecs = embed_corpus(texts, quiet=quiet)
     p = vec_db_path(proj_id)
     tmp = p.with_name(f"{p.stem}.tmp-{os.getpid()}.vec.db")
     tmp.unlink(missing_ok=True)
     shutil.copy2(p, tmp)
     con = _vec_connect(tmp)
     try:
-        con.execute(f"DELETE FROM vec WHERE item_id IN ({','.join('?' * len(ids))})", ids)
-        con.executemany("INSERT INTO vec(item_id, embedding) VALUES (?, ?)",
-                        [(i, v.tobytes()) for i, v in zip(ids, vecs)])
-        con.execute("INSERT OR REPLACE INTO vmeta(key,value) VALUES('built_at',?)", (repr(time.time()),))
+        qmarks = ",".join("?" * len(ids))
+        # drop every existing chunk of the refreshed items (an item's chunk count may change), then re-add
+        old_chunks = [r[0] for r in
+                      con.execute(f"SELECT chunk_id FROM chunk_map WHERE item_id IN ({qmarks})", ids).fetchall()]
+        if old_chunks:
+            cm = ",".join("?" * len(old_chunks))
+            con.execute(f"DELETE FROM vec WHERE chunk_id IN ({cm})", old_chunks)
+            con.execute(f"DELETE FROM chunk_map WHERE chunk_id IN ({cm})", old_chunks)
+        # fresh chunk_ids above the current max so they never collide with surviving rows
+        mx = con.execute("SELECT COALESCE(MAX(chunk_id), 0) FROM chunk_map").fetchone()[0]
+        cids = [c + mx for c in cids]
+        con.executemany("INSERT INTO vec(chunk_id, embedding) VALUES (?, ?)",
+                        [(c, v.tobytes()) for c, v in zip(cids, vecs)])
+        con.executemany("INSERT INTO chunk_map(chunk_id, item_id) VALUES (?, ?)", list(zip(cids, iids)))
+        vc = con.execute("SELECT COUNT(*) FROM vec").fetchone()[0]
+        ic = con.execute("SELECT COUNT(DISTINCT item_id) FROM chunk_map").fetchone()[0]
+        con.executemany("INSERT OR REPLACE INTO vmeta(key,value) VALUES (?,?)",
+                        [("built_at", repr(time.time())), ("vec_count", str(vc)), ("item_count", str(ic)),
+                         ("vec_watermark", new_wm)])
         con.commit()
     except BaseException:
         con.close()
@@ -936,21 +1212,29 @@ def _ensure_vector_index(proj_id):
 
 
 def _semantic_ids(proj_id, query, max_distance=VEC_MAX_DISTANCE):
-    """ALL (item_id, cosine_score) within the distance threshold, nearest first — no count cap. vec0 needs
-    a LIMIT, so we ask for the whole index then keep only cosine distance <= max_distance (sim >= 1-thr)."""
+    """ALL (item_id, cosine_score) within the distance threshold, nearest first — no count cap. The index
+    is CHUNKED: KNN runs over chunks, then each chunk is folded back to its item (chunk_map) keeping the
+    NEAREST chunk per item. vec0 needs a LIMIT, so we ask for the whole chunk set then threshold."""
     _ensure_vector_index(proj_id)
     _, vmeta = vec_index_state(proj_id)
-    # vec0 KNN requires a LIMIT and caps it at 4096. That's far more than the count of items within a
-    # sensible similarity threshold (>=0.70), so "all matches above the threshold" is fully covered.
+    # vec0 KNN requires a LIMIT and caps it at 4096 chunks. An item's best chunk is its nearest, so 4096
+    # chunks comfortably covers every item within a sensible similarity threshold (>=0.70).
     k = min(int(vmeta.get("vec_count") or 4096), 4096)
     qv = list(get_embedder().query_embed([query]))[0].astype("float32")  # bge query-side prefix applied
     con = _vec_connect(vec_db_path(proj_id))
     try:
-        knn = con.execute("SELECT item_id, distance FROM vec WHERE embedding MATCH ? ORDER BY distance LIMIT ?",
-                          (qv.tobytes(), k)).fetchall()
+        knn = con.execute(
+            "SELECT m.item_id, k.distance FROM "
+            "(SELECT chunk_id, distance FROM vec WHERE embedding MATCH ? ORDER BY distance LIMIT ?) k "
+            "JOIN chunk_map m ON m.chunk_id = k.chunk_id ORDER BY k.distance",
+            (qv.tobytes(), k)).fetchall()
     finally:
         con.close()
-    return [(r[0], round(1 - r[1], 3)) for r in knn if r[1] <= max_distance]  # distance = 1 - cosine sim
+    best = {}  # item_id -> nearest distance (knn is distance-sorted, so first seen is nearest)
+    for iid, dist in knn:
+        if dist <= max_distance and iid not in best:
+            best[iid] = dist
+    return [(iid, round(1 - dist, 3)) for iid, dist in best.items()]  # distance = 1 - cosine sim
 
 
 def _fts_ids(con, keywords, match, field):
@@ -973,7 +1257,8 @@ def _like_ids(con, keywords, match, field):
     order (deterministic/reproducible). Need EVERY item containing a term? That's a SQL `query`, not search."""
     if not keywords:
         return []
-    col = "(name || ' ' || COALESCE(description,''))" if field == "all" else "name"
+    col = ("(name || ' ' || COALESCE(description,'') || ' ' || COALESCE(stepsText,''))"
+           if field == "all" else "name")
     joiner = " AND " if match == "all" else " OR "
     where = "(" + joiner.join(f"{col} LIKE {sql_lit('%' + kw + '%')}" for kw in keywords) + ")"
     rows = con.execute(f"SELECT id FROM items WHERE {where} "
@@ -1094,9 +1379,10 @@ def ensure_synced(proj_id, name, force=False, offline=False, with_links=False, l
             build_vectors(proj_id, quiet=quiet)
         return res
     if want_vectors:  # only semantic/sync/rebuild touch vectors -> a plain keyword search never imports
-        sync_vectors(proj_id, res.get("changed_items"))       # fastembed (stays ms-fast). semantic auto-
-        if vec_index_state(proj_id)[0] != "ready":            # refreshes the index before every query, so
-            build_vectors(proj_id, quiet=quiet)               # it's never stale when it matters.
+        if vec_index_state(proj_id)[0] == "ready":            # fastembed. semantic/search call this before
+            refresh_vectors(proj_id, quiet=quiet)             # every query -> the index is never stale, incl.
+        else:                                                 # items a vectors-less `query` synced into main.
+            build_vectors(proj_id, quiet=quiet)               # absent/stale -> full (re)build
     if not quiet:
         if res.get("upserted"):
             print(f"[{proj_id} {name}] synced: {res['upserted']} item(s) updated")
@@ -1183,9 +1469,13 @@ def cmd_sync(a, force=False):
         s = ensure_synced(pr["id"], pr["name"], force=force,
                           with_links=a.with_links, link_cap=a.link_cap, concurrency=a.concurrency,
                           want_vectors=want_vectors)
-        total = int((time.time() - t) * 1000)
-        s = {**(s or {"proj_id": pr["id"], "name": pr["name"], "items": "(no change)"}), "total_ms": total}
-        s.pop("changed_items", None)  # internal (list of changed item tuples) — don't print/serialize
+        s = s or {"proj_id": pr["id"], "name": pr["name"], "items": "(no change)"}
+        if getattr(a, "prune_deleted", False):  # OPT-IN: also remove server-side deletions (cache + vectors)
+            rec = reconcile_deletions(pr["id"], pr["name"], concurrency=a.concurrency, quiet=a.json)
+            s["pruned_deleted"] = rec.get("deleted", 0)
+            if rec.get("chunks"):
+                s["pruned_chunks"] = rec["chunks"]
+        s["total_ms"] = int((time.time() - t) * 1000)
         summary.append(s)
     if a.json:
         print(json.dumps(summary, indent=2))
@@ -1217,7 +1507,8 @@ def cmd_status(a):
             vinfo = vstate
             if vstate != "absent":
                 vp = vec_db_path(t["id"])
-                vinfo = f"{vstate}({vmeta.get('vec_count','?')} vecs, {vp.stat().st_size/1048576:.1f}MB)"
+                vinfo = (f"{vstate}({vmeta.get('vec_count','?')} chunks/{vmeta.get('item_count','?')} items,"
+                         f" {vp.stat().st_size/1048576:.1f}MB)")
             line.update(name=m.get("project_name"), items=m.get("item_count"),
                         links=m.get("relationship_count"),
                         last_sync=_fmt(m.get("last_sync_at")),
@@ -1361,6 +1652,9 @@ def build_parser():
                         help="search/semantic/query: use the existing cache as-is, skip the online sync")
         sp.add_argument("--no-vectors", action="store_true", dest="no_vectors",
                         help="sync/rebuild: skip building/updating the semantic vector index")
+        sp.add_argument("--prune-deleted", action="store_true", dest="prune_deleted",
+                        help="sync: also detect & remove items deleted on the server (cache + vectors); "
+                             "OFF by default, cheap unless deletions exist")
         sp.add_argument("--with-links", action="store_true", dest="with_links")
         sp.add_argument("--link-cap", type=int, default=0, dest="link_cap")
         sp.add_argument("--all", action="store_true")
