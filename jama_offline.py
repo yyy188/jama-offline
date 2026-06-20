@@ -893,6 +893,13 @@ VEC_MAX_DISTANCE = 0.30  # vector hits must have cosine distance <= this (i.e. c
 LEG_CANDIDATES = 200     # FTS/LIKE per-leg candidate depth fed into RRF fusion. BM25's tail is near-zero
                          # noise (multi-word OR can match 40-70% of the corpus); 200 covers the real signal
                          # and the RRF tail weight 1/(60+200) is negligible. The FUSED output stays uncapped.
+# Parallel queries can briefly hold the vec file open, so refresh_vectors's atomic swap may fail with a
+# file-lock conflict (especially on Windows). Retry the swap with exponential backoff; if it still won't
+# settle after the max tries, SKIP the refresh and let the search run on the existing index (offline-style
+# fallback) instead of raising. vec_watermark is left unchanged, so the next query just retries the catch-up.
+VEC_SWAP_RETRIES = 8
+VEC_SWAP_BASE_DELAY = 0.1   # seconds; backoff = 0.1, 0.2, 0.4, ... capped at VEC_SWAP_MAX_DELAY
+VEC_SWAP_MAX_DELAY = 2.0
 
 
 def embed_threads():
@@ -1192,12 +1199,20 @@ def refresh_vectors(proj_id, quiet=True):
         tmp.unlink(missing_ok=True)
         raise
     con.close()
-    try:
-        os.replace(str(tmp), str(p))
-    except OSError:
-        tmp.unlink(missing_ok=True)
-        raise
-    return {"updated": len(ids)}
+    # Retry the swap on a transient file-lock conflict from parallel access; on exhaustion, skip the
+    # refresh (use the existing index — offline-style fallback) rather than crash the query.
+    for _attempt in range(VEC_SWAP_RETRIES):
+        try:
+            os.replace(str(tmp), str(p))
+            return {"updated": len(ids)}
+        except OSError:
+            if _attempt == VEC_SWAP_RETRIES - 1:
+                tmp.unlink(missing_ok=True)
+                if not quiet:
+                    print(f"[vectors] vec file busy from parallel access after {VEC_SWAP_RETRIES} tries -> "
+                          f"skipped refresh, using existing index", file=sys.stderr)
+                return None
+            time.sleep(min(VEC_SWAP_MAX_DELAY, VEC_SWAP_BASE_DELAY * (2 ** _attempt)))
 
 
 def _ensure_vector_index(proj_id):
