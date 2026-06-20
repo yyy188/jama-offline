@@ -40,6 +40,7 @@ python "SKILL_DIR/jama_offline.py" query    --project 12345 --sql "SELECT typeKe
   changed items before every run (seconds). `search` is HYBRID (keyword + substring + semantic, fused).
 - **First `search`/`semantic`** auto-installs vector deps (`fastembed`/`sqlite-vec`) + builds the index
   (~30-35 min one-time, progress bar). `semantic` = the pure-vector variant. `projects`/`query` need no extras.
+  Deps + the model download **China-mirror-first with a live speed test + progress** (see "Downloads" below).
 
 ---
 
@@ -106,13 +107,31 @@ measurement** tool. Either is allowed for any goal — just know the trade-off:
 
 ---
 
+## Downloads: China-first mirrors + progress (auto, no flags)
+
+Every **non-Jama** download (the `fastembed`/`sqlite-vec` pip deps and the ~210 MB embedding model) is
+fetched **China-mirror-first**, decided by a quick **live speed test** before downloading:
+
+- pip deps → tries Tsinghua / Aliyun / Tencent (then falls back to `pypi.org`); the embedding model →
+  `hf-mirror.com` (then `huggingface.co`). The **first source ≥ the speed threshold wins**.
+- If every China mirror is too slow it switches to the international source; **if that is also too
+  slow/unreachable it ABORTS** with a `网络异常 / Network error` message instead of hanging.
+- Tune the cutoff with **`JAMA_MIN_KBPS`** (default 150 KB/s). A user-set `PIP_INDEX_URL` / `HF_ENDPOINT`
+  is respected as-is. **Jama API traffic is never rerouted.**
+- **Progress feedback** streams to **stderr** for every long step — pip install, model download (MB / %),
+  the full + incremental cache downloads, and vector (re)embedding — so a one-time build is never silent.
+
+(These are automatic; you don't pass any flag. If a run prints `网络异常`, the network/mirrors are the issue.)
+
+---
+
 ## Commands (quick reference)
 
 | Command | What it does |
 |---------|--------------|
 | `login --base <url> --client-id <id> --client-secret <s>` | Save credentials once to a user-level file (validated by fetching a token). `logout` removes them. |
 | `projects --project <name/regex>` | List matching projects → get the **id**. Step 1, always. |
-| `search --project <id> --keyword a,b` | **Main tool. HYBRID** = FTS + LIKE + semantic, RRF-fused & de-duped. Auto-syncs + auto-builds vectors. |
+| `search --project <id> --keyword a,b` | **Main tool. HYBRID** = FTS + LIKE + semantic, RRF-fused & de-duped. Auto-syncs + auto-builds vectors. Supports `--expr "(a or b) and not c"` (boolean) and `--created-/--modified-after/-before` date filters. |
 | `semantic --project <id> --query "…"` | **Meaning-based** (vector) search; finds paraphrases/synonyms. Needs vector extras (see below). |
 | `query --project <id> --sql "SELECT ..."` | Read-only SQL for counts/filters/joins. Auto-syncs. |
 | `status` | Show what's cached: state, last-sync, watermark, size, vector-index state. |
@@ -147,6 +166,15 @@ i.e. action / expectedResult / notes).
 Rules:
 - `--keyword a,b` (comma = OR; `--match all` = AND) and/or `--query "natural language"` (drives the vector
   leg). At least one is required; give `--query` for fuzzy intent, `--keyword` for specific terms.
+- **Boolean expressions — `--expr "…"`** for AND/OR/NOT + parentheses, e.g.
+  `--expr "(dock or cradle) and (charge or power) and not legacy"`. Operators are case-insensitive words
+  (`and`/`or`/`not`) or symbols (`&`/`|`/`!`); full-width `（）` are accepted; adjacent terms = AND; quote a
+  phrase (`"answer call"`). The expression drives the **keyword (FTS) + substring (LIKE)** legs exactly; the
+  vector leg still runs on `--query` (or the expression's positive terms) for meaning-based recall. (A
+  pure/top-level `not …` can't be expressed in FTS, so only the LIKE+vector legs run for it.)
+- **Date-range filters** (inclusive): `--created-after`, `--created-before`, `--modified-after`,
+  `--modified-before`, value `YYYY-MM-DD` (or a full ISO timestamp). A bare date upper bound includes the
+  whole day. Applies to ALL legs. For an EXACT date-bounded count, prefer `query` SQL on `createdDate`/`modifiedDate`.
 - Quote a keyword with a space: `--keyword "answer call"`. `--field name` restricts FTS/LIKE to the name.
 - `--type REQ[,FEAT]` limits kinds. `--top N` caps rows (default 0 = all). `--max-distance D` tunes the
   vector threshold (default 0.30; lower = stricter, e.g. `0.20`; higher = looser). Output: `score via name`.
@@ -154,6 +182,8 @@ Rules:
 ```bash
 python "SKILL_DIR/jama_offline.py" search --project 12345 --keyword docking --type REQ
 python "SKILL_DIR/jama_offline.py" search --project 12345 --query "headset won't charge on the cradle"
+python "SKILL_DIR/jama_offline.py" search --project 12345 --expr "(dock or cradle) and not legacy" --type REQ
+python "SKILL_DIR/jama_offline.py" search --project 12345 --keyword battery --created-after 2026-01-01 --created-before 2026-06-30
 python "SKILL_DIR/jama_offline.py" search --project 12345 --keyword mute --max-distance 0.25 --top 50
 ```
 Output columns: `id  documentKey  typeKey  sequence  name`. Report `documentKey` + `name` to the user.
@@ -196,7 +226,9 @@ Finds items by **meaning**, not literal words — catches paraphrases/synonyms t
 python "SKILL_DIR/jama_offline.py" semantic --project 12345 --query "headset won't charge on the cradle"
 python "SKILL_DIR/jama_offline.py" semantic --project 12345 --query "noise cancellation on calls" --type REQ
 python "SKILL_DIR/jama_offline.py" semantic --project 12345 --query "battery life" --max-distance 0.45  # looser
+python "SKILL_DIR/jama_offline.py" semantic --project 12345 --query "battery life" --modified-after 2026-01-01
 ```
+`semantic` also accepts the same `--created-after/-before` and `--modified-after/-before` date filters as `search`.
 Output columns: `id  documentKey  typeKey  sequence  score  name` (score = cosine similarity 0–1).
 Returns **every** item with **cosine similarity >= 0.70** (distance <= 0.30) — items below the threshold
 are dropped, and there's no count cap (`--top N` to limit). Tune the cutoff with **`--max-distance D`**
@@ -207,9 +239,9 @@ are dropped, and there's no count cap (`--top N` to limit). Tune the cutoff with
 - **One-time index build:** the first `search`/`semantic`/`sync`/`rebuild` splits every item's
   name+description+steps into overlapping chunks and embeds each with `BAAI/bge-base-en-v1.5` (768-d) →
   a separate `jama-proj-<id>.vec.db`. This is the slow part: **downloads
-  a ~200 MB model once, then ~30–35 min for a 10k-item project on CPU** (a progress bar with %/ETA shows on
-  stderr). Uses ~80% of CPU threads. After that, incremental syncs only re-embed *changed* items (seconds),
-  and each query is milliseconds.
+  a ~210 MB model once** (China-mirror-first, speed-tested — see "Downloads"), **then ~30–35 min for a
+  10k-item project on CPU** (a progress bar with %/ETA shows on stderr). Uses ~80% of CPU threads. After
+  that, incremental syncs only re-embed *changed* items (seconds), and each query is milliseconds.
 
 ---
 
@@ -263,6 +295,9 @@ Copy the whole `jama-offline` folder. Then:
 | `fts5: syntax error` (internal) | Odd characters in a keyword | The FTS leg is auto-skipped; LIKE+vector still run. Simplify keywords if needed. |
 | `Missing credentials` | No Jama API keys found | Run `login` once (see Portability), or set env vars. |
 | `Could not auto-install vector deps` | pip blocked/offline | Install manually: `pip install fastembed sqlite-vec`. |
+| `网络异常 / Network error … no mirror … fast enough` | Both the China mirror AND the international source were too slow/unreachable for a pip-deps or model download | Check the connection; retry; or lower the bar with `JAMA_MIN_KBPS` (e.g. `50`), or set `PIP_INDEX_URL` / `HF_ENDPOINT`. |
+| `Invalid --created-after/…` | Bad date value | Use `YYYY-MM-DD` (or a full ISO timestamp). |
+| `Could not parse --expr` | Malformed boolean expression | Balance the parens; use `and`/`or`/`not`; quote phrases with spaces. |
 | `Login FAILED` | Wrong base/id/secret (token call 401) | Re-check the three values; nothing is saved on failure. |
 
 First `search`/`semantic` on a NEW project also builds the vector index (~30–35 min, progress bar) + a

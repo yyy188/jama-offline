@@ -53,7 +53,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 SKILL_DIR = Path(__file__).resolve().parent
-ENGINE_VERSION = "4.1.0-py"
+ENGINE_VERSION = "4.2.0-py"
 # v4: caches are PERSISTENT (no TTL/expiry). Each use incrementally syncs items whose modifiedDate is
 # >= the cache's watermark (= MAX(modifiedDate)), upserts them, and rebuilds the FTS index. Deletions
 # on the server are NOT tracked (only adds/changes) — use `rebuild` for a clean full re-download.
@@ -61,6 +61,11 @@ ENGINE_VERSION = "4.1.0-py"
 # extracted into items.stepsText, indexed by FTS + LIKE, and embedded into the vector index. The vector
 # index now CHUNKS each item's full text (name + description + steps) with overlap instead of truncating,
 # so long test cases are searchable end to end; chunk hits fold back to one row per item at query time.
+# v4.2: (a) every NON-Jama download (pip deps + the embedding model) PREFERS a China mirror chosen by a
+# live speed test (China-first, international fallback, abort if neither is fast enough) — Jama API traffic
+# is untouched; (b) all long downloads/builds emit periodic progress to stderr (pip install, model
+# download, full + incremental cache builds, vector (re)embedding); (c) `search --expr` accepts boolean
+# keyword expressions — AND/OR/NOT + parentheses, e.g. "(dock or cradle) and not legacy". No schema change.
 SCHEMA_VERSION = "5"
 MAX_PROJECTS = 5
 PAGE = 50
@@ -672,7 +677,8 @@ def incremental_sync(proj_id, name, concurrency=CONCURRENCY_DEFAULT):
     # every time; that's a cheap idempotent re-upsert and is deliberate — using '>' instead would miss a
     # new item written in the same millisecond as the current high-water mark.
     enc = urllib.parse.quote(watermark, safe="")
-    items = get_pages(f"/rest/v1/abstractitems?project={proj_id}&modifiedDate={enc}", concurrency=concurrency)
+    items = get_pages(f"/rest/v1/abstractitems?project={proj_id}&modifiedDate={enc}", concurrency=concurrency,
+                      progress_label=f"sync {name}")  # shows a bar when the delta spans >1 page
     timings["fetch_ms"] = int((time.time() - t) * 1000)
     timings["pulled"] = len(items)
 
@@ -871,6 +877,160 @@ def reconcile_deletions(proj_id, name, concurrency=CONCURRENCY_DEFAULT, quiet=Fa
     return {"deleted": res["items"], "chunks": res["chunks"], "method": "sweep"}
 
 
+# ============================ downloads: China-first mirrors + live speed test + progress ============================
+# SPEC: every NON-Jama download (pip deps + the embedding model) prefers a China mirror, falls back to the
+# international source, and ABORTS if neither is fast enough. Jama API traffic (api_get) is NOT touched.
+# A short speed probe (download a ~1MB sample) ranks candidates: China mirrors are tried first; the first
+# one sustaining >= MIN_KBPS wins; if every China mirror is too slow we try the international source; if
+# that is also too slow/unreachable we stop and tell the user the network looks broken.
+PYPI_MIRRORS = [  # (label, simple-index base, is_china); China entries first, international last
+    ("tuna-tsinghua", "https://pypi.tuna.tsinghua.edu.cn/simple", True),
+    ("aliyun",        "https://mirrors.aliyun.com/pypi/simple",   True),
+    ("tencent",       "https://mirrors.cloud.tencent.com/pypi/simple", True),
+    ("pypi.org",      "https://pypi.org/simple",                  False),
+]
+HF_MIRRORS = [  # (label, HF endpoint, is_china); hf-mirror.com is the standard China HuggingFace mirror
+    ("hf-mirror.com", "https://hf-mirror.com",  True),
+    ("huggingface.co", "https://huggingface.co", False),
+]
+# The HF repo fastembed actually pulls for BAAI/bge-base-en-v1.5 (cache dir models--qdrant--...-onnx-q),
+# used both to speed-test the mirror and to detect "already downloaded".
+HF_MODEL_REPO = "qdrant/bge-base-en-v1.5-onnx-q"
+HF_MODEL_FILE = "model_optimized.onnx"
+PROBE_BYTES = 1 << 20   # speed-probe sample size (1 MiB)
+PROBE_TIMEOUT = 12      # seconds per probe
+
+
+def min_kbps():
+    """'Too slow' cutoff for the download speed test, in KB/s. Override with $JAMA_MIN_KBPS. Default 150
+    KB/s (~24 min worst case for the 210MB model); healthy mirrors run far faster and are picked first."""
+    try:
+        return float(os.environ.get("JAMA_MIN_KBPS", "150"))
+    except ValueError:
+        return 150.0
+
+
+def _probe_kbps(url, sample=PROBE_BYTES, timeout=PROBE_TIMEOUT):
+    """Download up to `sample` bytes from url and return throughput in KB/s, or None on any failure/timeout.
+    urllib follows 3xx automatically, so HF LFS resolve->CDN redirects are handled. We stop at `sample`
+    bytes or `timeout` seconds regardless of whether the server honours the Range header."""
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "jama-offline/4.2",
+                                                   "Range": f"bytes=0-{sample - 1}"})
+        t0 = time.time()
+        got = 0
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            while got < sample and time.time() - t0 <= timeout:
+                chunk = r.read(65536)
+                if not chunk:
+                    break
+                got += len(chunk)
+        el = time.time() - t0
+        if got <= 0 or el <= 0:
+            return None
+        return (got / 1024.0) / el
+    except Exception:
+        return None
+
+
+def choose_mirror(candidates, probe_url, what):
+    """Pick a download source by live speed test. `candidates` = (label, base, is_china) with China first.
+    Probe each in order; return (label, base) of the FIRST whose speed >= min_kbps(), else None (=> the
+    caller aborts because neither China nor international was fast enough). `probe_url` maps base -> a real
+    sample URL on that host."""
+    need = min_kbps()
+    for label, base, is_cn in candidates:
+        kbps = _probe_kbps(probe_url(base))
+        where = "China" if is_cn else "international"
+        if kbps is None:
+            print(f"[net] {what}: {label} ({where}) unreachable -> trying next…", file=sys.stderr)
+        elif kbps >= need:
+            print(f"[net] {what}: {label} ({where}) {kbps:.0f} KB/s OK -> using it", file=sys.stderr)
+            return label, base
+        else:
+            print(f"[net] {what}: {label} ({where}) only {kbps:.0f} KB/s (< {need:.0f}) -> trying next…",
+                  file=sys.stderr)
+    return None
+
+
+def _stream_subprocess(cmd, label, interval=2.0):
+    """Run `cmd`, streaming a throttled one-line status to stderr every `interval`s (latest output line +
+    elapsed seconds) so long pip steps give periodic feedback. Returns (returncode, full_output)."""
+    import subprocess
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+                            bufsize=1, encoding="utf-8", errors="replace")
+    st = {"line": "", "done": False}
+    log = []
+
+    def reader():
+        for ln in proc.stdout:
+            ln = ln.rstrip()
+            if ln:
+                log.append(ln)
+                st["line"] = ln
+        st["done"] = True
+
+    th = threading.Thread(target=reader, daemon=True)
+    th.start()
+    t0 = last = time.time()
+    while not st["done"]:
+        time.sleep(0.2)
+        now = time.time()
+        if now - last >= interval:
+            last = now
+            sys.stderr.write(f"\r  {label}  {int(now - t0):4d}s  {st['line'][:78]:<80}")
+            sys.stderr.flush()
+    proc.wait()
+    th.join(timeout=2)
+    sys.stderr.write(f"\r  {label}  done in {int(time.time() - t0)}s{' ' * 86}\n")
+    sys.stderr.flush()
+    return proc.returncode, "\n".join(log)
+
+
+class _DirGrowthProgress(threading.Thread):
+    """Periodic stderr progress for an opaque download (the model files) by watching a directory grow:
+    reports MB written + elapsed (+ % when est_mb is known). Robust — independent of the downloader's own
+    output, so it works whether fastembed prints a bar or not."""
+
+    def __init__(self, path, label, est_mb=None, interval=2.0):
+        super().__init__(daemon=True)
+        self.path, self.label, self.est_mb, self.interval = Path(path), label, est_mb, interval
+        self._stop = threading.Event()
+        self._base = self._size_mb()
+        self._t0 = time.time()
+
+    def _size_mb(self):
+        total = 0
+        try:
+            for f in self.path.rglob("*"):
+                try:
+                    if f.is_file():
+                        total += f.stat().st_size
+                except OSError:
+                    pass
+        except OSError:
+            pass
+        return total / 1048576.0
+
+    def run(self):
+        while not self._stop.wait(self.interval):
+            mb = max(0.0, self._size_mb() - self._base)
+            el = int(time.time() - self._t0)
+            if self.est_mb:
+                pct = min(99, int(mb * 100 / self.est_mb))
+                bar = "#" * (pct // 5) + "-" * (20 - pct // 5)
+                sys.stderr.write(f"\r  {self.label} [{bar}] {pct:3d}%  {mb:4.0f}/{self.est_mb}MB  {el:4d}s ")
+            else:
+                sys.stderr.write(f"\r  {self.label}  {mb:4.0f}MB  {el:4d}s ")
+            sys.stderr.flush()
+
+    def stop(self):
+        self._stop.set()
+        mb = max(0.0, self._size_mb() - self._base)
+        sys.stderr.write(f"\r  {self.label}  done {mb:.0f}MB in {int(time.time() - self._t0)}s{' ' * 40}\n")
+        sys.stderr.flush()
+
+
 # ============================ semantic / vector search (OPTIONAL: fastembed + sqlite-vec) ============================
 # Kept fully optional via lazy imports: the core engine (FTS/LIKE/SQL) imports nothing here, so the skill
 # still runs with only the standard library. Semantic search needs `pip install fastembed sqlite-vec`
@@ -925,9 +1085,44 @@ def _vectors_importable():
     return all(importlib.util.find_spec(m) for m in ("fastembed", "sqlite_vec"))
 
 
+def _pip_cmd(index_url, packages):
+    cmd = [sys.executable, "-m", "pip", "install", "--disable-pip-version-check"]
+    if index_url:  # mirror chosen by the speed test (else pip uses its own configured default)
+        cmd += ["--index-url", index_url]
+    return cmd + list(packages)
+
+
+def _pip_install(packages):
+    """pip install `packages` with periodic progress, preferring a China mirror chosen by the live speed
+    test (China-first, international fallback, abort if both too slow). Honours a user-set PIP_INDEX_URL."""
+    if os.environ.get("PIP_INDEX_URL"):  # user already configured an index -> just install + show progress
+        rc, out = _stream_subprocess(_pip_cmd(None, packages), "[deps] pip install")
+        if rc == 0:
+            return
+        sys.exit(f"pip install failed (PIP_INDEX_URL={os.environ['PIP_INDEX_URL']}):\n{out[-800:]}")
+    chosen = choose_mirror(PYPI_MIRRORS, lambda b: f"{b}/numpy/", "pip deps")
+    if chosen is None:
+        sys.exit("网络异常：所有 PyPI 镜像（中国站点与国外站点）均无法以可用速度访问，已中止依赖安装。\n"
+                 "Network error: no PyPI mirror (China or international) was fast enough; aborting dependency "
+                 "install. Check the connection, set PIP_INDEX_URL, or lower JAMA_MIN_KBPS.")
+    # try the speed-winner; if it errors mid-install (and it was a China mirror), fall back to pypi.org once
+    order, intl = [chosen], (PYPI_MIRRORS[-1][0], PYPI_MIRRORS[-1][1])
+    if chosen[1] != intl[1]:
+        order.append(intl)
+    last = ""
+    for label, base in order:
+        rc, out = _stream_subprocess(_pip_cmd(base, packages), f"[deps] pip install via {label}")
+        if rc == 0:
+            return
+        last = out
+        print(f"[deps] install via {label} failed -> trying next index…", file=sys.stderr)
+    sys.exit(f"Could not auto-install vector deps. Last pip output:\n{last[-800:]}\n"
+             f"Run manually: {sys.executable} -m pip install fastembed sqlite-vec")
+
+
 def ensure_vectors():
     """Vectors are REQUIRED — no graceful degradation. If fastembed + sqlite-vec are absent, auto
-    `pip install` them once and retry. Exits only if the install itself fails."""
+    `pip install` them once (China-mirror-first, with progress) and retry. Exits only if install fails."""
     global _vectors_ready
     if _vectors_ready:
         return
@@ -935,14 +1130,8 @@ def ensure_vectors():
         _vectors_ready = True
         return
     print("[deps] vector libraries missing -> installing fastembed + sqlite-vec (one-time)...", file=sys.stderr)
+    _pip_install(["fastembed", "sqlite-vec"])
     import importlib
-    import subprocess
-    try:
-        subprocess.check_call([sys.executable, "-m", "pip", "install", "--disable-pip-version-check",
-                               "--quiet", "fastembed", "sqlite-vec"])
-    except (subprocess.CalledProcessError, OSError) as e:
-        sys.exit(f"Could not auto-install vector deps ({e}). Run manually: "
-                 f"{sys.executable} -m pip install fastembed sqlite-vec")
     importlib.invalidate_caches()
     if not _vectors_importable():
         sys.exit("Vector deps still unavailable after install.")
@@ -952,14 +1141,56 @@ def ensure_vectors():
 _embedder = None
 
 
+def _model_cached():
+    """True if the embedding model's ONNX weights are already in the cache (so no download will happen).
+    Matches the fastembed/huggingface_hub cache layout: models--qdrant--bge-base-en-v1.5-onnx-q/.../*.onnx."""
+    try:
+        for d in model_cache_dir().glob("models--*bge-base-en-v1.5*"):
+            if any(d.rglob(HF_MODEL_FILE)):
+                return True
+    except OSError:
+        pass
+    return False
+
+
+def _configure_hf_endpoint():
+    """Point huggingface_hub at a China mirror (speed-tested) BEFORE fastembed is imported. No-op when
+    HF_ENDPOINT is already set, or the model is already cached (no download -> no need to probe/abort).
+    Aborts if neither the China mirror nor huggingface.co is fast enough (spec)."""
+    if os.environ.get("HF_ENDPOINT") or _model_cached():
+        return
+    probe = lambda base: f"{base}/{HF_MODEL_REPO}/resolve/main/{HF_MODEL_FILE}"
+    chosen = choose_mirror(HF_MIRRORS, probe, "embedding model")
+    if chosen is None:
+        sys.exit("网络异常：HuggingFace 镜像（中国站点 hf-mirror.com 与官方 huggingface.co）均无法以可用速度"
+                 "访问，已中止模型下载。\nNetwork error: neither the China HF mirror nor huggingface.co was "
+                 "fast enough to download the embedding model; aborting. Check the connection or lower "
+                 "JAMA_MIN_KBPS.")
+    os.environ["HF_ENDPOINT"] = chosen[1]
+    print(f"[model] HuggingFace endpoint -> {chosen[1]}", file=sys.stderr)
+
+
 def get_embedder():
-    """Lazy singleton TextEmbedding pinned to a persistent cache dir and 80%-CPU threads."""
+    """Lazy singleton TextEmbedding pinned to a persistent cache dir and 80%-CPU threads. On the first run
+    (model not yet cached) it picks a China-first HF mirror by speed test and shows a download progress
+    bar (MB / %) driven by watching the cache dir grow."""
     global _embedder
     if _embedder is None:
         os.environ.setdefault("OMP_NUM_THREADS", str(embed_threads()))  # belt-and-suspenders w/ threads=
+        _configure_hf_endpoint()  # China-first HF mirror, set before importing fastembed/huggingface_hub
         from fastembed import TextEmbedding
-        _embedder = TextEmbedding(model_name=EMBED_MODEL, threads=embed_threads(),
-                                  cache_dir=str(model_cache_dir()))
+        mk = lambda: TextEmbedding(model_name=EMBED_MODEL, threads=embed_threads(),
+                                   cache_dir=str(model_cache_dir()))
+        if _model_cached():
+            _embedder = mk()
+        else:
+            print(f"[model] downloading {EMBED_MODEL} (~210MB, one-time)…", file=sys.stderr)
+            hb = _DirGrowthProgress(model_cache_dir(), "[model] downloading", est_mb=210)
+            hb.start()
+            try:
+                _embedder = mk()
+            finally:
+                hb.stop()
     return _embedder
 
 
@@ -1105,12 +1336,13 @@ def build_vectors(proj_id, quiet=False):
     chunk_ids = [chunk_ids[i] for i in order]
     item_ids = [item_ids[i] for i in order]
     texts = [texts[i] for i in order]
-    if not quiet:
-        print(f"[vectors] embedding {len(texts)} chunks from {n_items} items — {EMBED_MODEL}, "
-              f"{embed_threads()} threads (one-time, ~35-45 min for 10k items on CPU; later syncs only "
-              f"re-embed changed items)")
+    # Always announce + show the embedding bar (even on the otherwise-quiet search/semantic path): this is
+    # the multi-minute step the user must be able to watch, so progress is NOT gated by `quiet`.
+    print(f"[vectors] embedding {len(texts)} chunks from {n_items} items — {EMBED_MODEL}, "
+          f"{embed_threads()} threads (one-time, ~35-45 min for 10k items on CPU; later syncs only "
+          f"re-embed changed items)", file=sys.stderr)
     t = time.time()
-    vecs = embed_corpus(texts, label="embed", quiet=quiet)
+    vecs = embed_corpus(texts, label="embed", quiet=False)
     p = vec_db_path(proj_id)
     tmp = p.with_name(f"{p.stem}.tmp-{os.getpid()}.vec.db")
     tmp.unlink(missing_ok=True)
@@ -1167,7 +1399,9 @@ def refresh_vectors(proj_id, quiet=True):
     ensure_vectors()
     ids = sorted({r["id"] for r in rows})
     cids, iids, texts = _chunk_units(rows)
-    vecs = embed_corpus(texts, quiet=quiet)
+    # Show the re-embed bar regardless of `quiet` so an incremental sync (full OR via search/semantic) gives
+    # periodic feedback on the changed items being re-embedded; it's a short, signal-only stderr line.
+    vecs = embed_corpus(texts, label=f"re-embed {len(ids)} item(s)", quiet=False)
     p = vec_db_path(proj_id)
     tmp = p.with_name(f"{p.stem}.tmp-{os.getpid()}.vec.db")
     tmp.unlink(missing_ok=True)
@@ -1252,38 +1486,196 @@ def _semantic_ids(proj_id, query, max_distance=VEC_MAX_DISTANCE):
     return [(iid, round(1 - dist, 3)) for iid, dist in best.items()]  # distance = 1 - cosine sim
 
 
-def _fts_ids(con, keywords, match, field):
-    """Top-LEG_CANDIDATES FTS (keyword/BM25) matches — the relevant head; the long BM25 tail is noise."""
+# ============================ boolean keyword expressions (search --expr / --keyword) ============================
+# A tiny boolean mini-language over keywords for `search`: AND / OR / NOT + parentheses, e.g.
+#   (dock or cradle) and (charge or power) and not legacy
+# Operators are case-insensitive words (and/or/not) OR symbols (& && | || !); full-width parens （） are
+# accepted; commas separate terms. Adjacent terms with no operator mean AND ("answer call" in quotes is
+# ONE phrase term). The SAME parsed AST drives the FTS5 leg (native AND/OR/NOT) and the LIKE leg (nested
+# SQL); the vector leg uses the positive leaf terms (or --query), since meaning-search can't honour
+# boolean logic. Parsing is best-effort: a malformed expression falls back to a flat keyword list.
+_TOK_LP, _TOK_RP, _TOK_AND, _TOK_OR, _TOK_NOT, _TOK_TERM = "LP", "RP", "AND", "OR", "NOT", "TERM"
+
+
+def _tokenize_bool(s):
+    s = (s or "").replace("（", "(").replace("）", ")")
+    toks, i, n = [], 0, len(s)
+    while i < n:
+        c = s[i]
+        if c.isspace() or c == ",":
+            i += 1
+        elif c == "(":
+            toks.append((_TOK_LP, None)); i += 1
+        elif c == ")":
+            toks.append((_TOK_RP, None)); i += 1
+        elif c == '"':                                  # quoted phrase = one TERM
+            j = s.find('"', i + 1)
+            if j < 0:
+                j = n
+            toks.append((_TOK_TERM, s[i + 1:j])); i = j + 1
+        elif c == "&":
+            toks.append((_TOK_AND, None)); i += 2 if s[i:i + 2] == "&&" else 1
+        elif c == "|":
+            toks.append((_TOK_OR, None)); i += 2 if s[i:i + 2] == "||" else 1
+        elif c == "!":
+            toks.append((_TOK_NOT, None)); i += 1
+        else:                                           # bare word: term, or a word-operator (and/or/not)
+            j = i
+            while j < n and not s[j].isspace() and s[j] not in '(),&|!"':
+                j += 1
+            w, lw = s[i:j], s[i:j].lower()
+            toks.append((_TOK_AND, None) if lw == "and" else
+                        (_TOK_OR, None) if lw == "or" else
+                        (_TOK_NOT, None) if lw == "not" else
+                        (_TOK_TERM, w))
+            i = j
+    return toks
+
+
+def parse_bool_expr(s):
+    """Parse a boolean keyword expression into an AST: ('AND'|'OR', [children]) | ('NOT', child) |
+    ('TERM', word). Raises ValueError on malformed input (caller falls back to a flat keyword list)."""
+    toks = _tokenize_bool(s)
+    if not toks:
+        raise ValueError("empty expression")
+    pos = [0]
+
+    def peek():
+        return toks[pos[0]][0] if pos[0] < len(toks) else None
+
+    def take():
+        t = toks[pos[0]]; pos[0] += 1; return t
+
+    def p_or():
+        nodes = [p_and()]
+        while peek() == _TOK_OR:
+            take(); nodes.append(p_and())
+        return ("OR", nodes) if len(nodes) > 1 else nodes[0]
+
+    def p_and():
+        nodes = [p_not()]
+        while peek() in (_TOK_AND, _TOK_NOT, _TOK_TERM, _TOK_LP):  # explicit AND or implicit adjacency
+            if peek() == _TOK_AND:
+                take()
+            nodes.append(p_not())
+        return ("AND", nodes) if len(nodes) > 1 else nodes[0]
+
+    def p_not():
+        if peek() == _TOK_NOT:
+            take(); return ("NOT", p_not())
+        return p_atom()
+
+    def p_atom():
+        t = peek()
+        if t == _TOK_LP:
+            take(); node = p_or()
+            if peek() != _TOK_RP:
+                raise ValueError("unbalanced parenthesis")
+            take(); return node
+        if t == _TOK_TERM:
+            return ("TERM", take()[1])
+        raise ValueError(f"unexpected token {t}")
+
+    tree = p_or()
+    if pos[0] != len(toks):
+        raise ValueError("trailing tokens")
+    return tree
+
+
+def bool_to_fts(node):
+    """Compile the AST to an FTS5 MATCH string. FTS5 has no UNARY NOT, so NOT is only emitted as the right
+    side of an AND (X NOT Y); a NOT that can't be placed that way raises -> the FTS leg is dropped (LIKE +
+    vector still run)."""
+    typ = node[0]
+    if typ == "TERM":
+        return '"' + node[1].replace('"', '""') + '"'
+    if typ == "OR":
+        return "(" + " OR ".join(bool_to_fts(c) for c in node[1]) + ")"  # OR-of-NOT child raises (intended)
+    if typ == "AND":
+        pos = [c for c in node[1] if c[0] != "NOT"]
+        neg = [c[1] for c in node[1] if c[0] == "NOT"]
+        if not pos:
+            raise ValueError("FTS needs at least one positive term in an AND")
+        expr = "(" + " AND ".join(bool_to_fts(c) for c in pos) + ")"
+        for ng in neg:
+            expr += " NOT " + bool_to_fts(ng)
+        return expr
+    raise ValueError("NOT not expressible in FTS at this position")  # bare/top-level NOT
+
+
+def bool_to_like(node, col):
+    """Compile the AST to a SQL boolean over `col LIKE '%term%'` (full AND/OR/NOT + parens)."""
+    typ = node[0]
+    if typ == "TERM":
+        return f"{col} LIKE {sql_lit('%' + node[1] + '%')}"
+    if typ == "OR":
+        return "(" + " OR ".join(bool_to_like(c, col) for c in node[1]) + ")"
+    if typ == "AND":
+        return "(" + " AND ".join(bool_to_like(c, col) for c in node[1]) + ")"
+    if typ == "NOT":
+        return "(NOT " + bool_to_like(node[1], col) + ")"
+    raise ValueError("bad node")
+
+
+def bool_terms(node, positive_only=True):
+    """Leaf terms of the AST; skips NOT-negated terms when positive_only (used to seed the vector leg)."""
+    t = node[0]
+    if t == "TERM":
+        return [node[1]]
+    if t == "NOT":
+        return [] if positive_only else bool_terms(node[1], positive_only)
+    return [x for c in node[1] for x in bool_terms(c, positive_only)]
+
+
+def ast_from_keywords(keywords, match):
+    """Build a flat AST from a comma keyword list + --match (any=OR, all=AND). None if no keywords."""
     if not keywords:
+        return None
+    leaves = [("TERM", k) for k in keywords]
+    if len(leaves) == 1:
+        return leaves[0]
+    return ("AND" if match == "all" else "OR", leaves)
+
+
+def _fts_ids(con, ast, field, dates=None):
+    """Top-LEG_CANDIDATES FTS (keyword/BM25) matches for the boolean AST — the relevant head; the long BM25
+    tail is noise. Returns [] when the AST is None or not expressible in FTS5 (other legs still run).
+    `dates` (optional) further restricts to a created/modified range, pushed into the SQL for recall."""
+    if ast is None:
         return []
-    m = fts_query(keywords, match)
+    try:
+        m = bool_to_fts(ast)
+    except ValueError:
+        return []  # e.g. a top-level NOT -> not expressible in FTS5; rely on LIKE + vector
     if field == "name":
         m = "name : (" + m + ")"
+    where = "fts MATCH ?" + "".join(" AND " + c for c in _date_conds(dates, "i."))
     try:
-        rows = con.execute("SELECT i.id FROM fts JOIN items i ON i.id = fts.rowid WHERE fts MATCH ? "
+        rows = con.execute(f"SELECT i.id FROM fts JOIN items i ON i.id = fts.rowid WHERE {where} "
                            "ORDER BY bm25(fts) LIMIT ?", (m, LEG_CANDIDATES)).fetchall()
         return [r[0] for r in rows]
     except sqlite3.OperationalError:
         return []  # odd chars -> fts5 syntax error: drop this leg, the others still run
 
 
-def _like_ids(con, keywords, match, field):
-    """Up-to-LEG_CANDIDATES substring (LIKE) matches. LIKE has no relevance order, so take them in document
-    order (deterministic/reproducible). Need EVERY item containing a term? That's a SQL `query`, not search."""
-    if not keywords:
+def _like_ids(con, ast, field, dates=None):
+    """Up-to-LEG_CANDIDATES substring (LIKE) matches for the boolean AST, in document order (deterministic).
+    Need EVERY item containing a term? That's a SQL `query`, not search. `dates` adds a created/modified
+    range filter."""
+    if ast is None:
         return []
     col = ("(name || ' ' || COALESCE(description,'') || ' ' || COALESCE(stepsText,''))"
            if field == "all" else "name")
-    joiner = " AND " if match == "all" else " OR "
-    where = "(" + joiner.join(f"{col} LIKE {sql_lit('%' + kw + '%')}" for kw in keywords) + ")"
+    where = bool_to_like(ast, col) + "".join(" AND " + c for c in _date_conds(dates, ""))
     rows = con.execute(f"SELECT id FROM items WHERE {where} "
                        f"ORDER BY CASE WHEN globalSortOrder IS NULL THEN 1 ELSE 0 END, globalSortOrder "
                        f"LIMIT ?", (LEG_CANDIDATES,)).fetchall()
     return [r[0] for r in rows]
 
 
-def _join_items(proj_id, ids, type_arg):
-    """Map id -> item row for the given ids, applying an optional --type filter."""
+def _join_items(proj_id, ids, type_arg, dates=None):
+    """Map id -> item row for the given ids, applying an optional --type filter and created/modified date
+    range. This is also where the vector leg (which has no SQL pre-filter) gets the date/type filter."""
     if not ids:
         return {}
     main = open_db(proj_id)
@@ -1292,6 +1684,7 @@ def _join_items(proj_id, ids, type_arg):
         tclause = type_clause(type_arg)
         if tclause:
             where += " AND " + tclause
+        where += "".join(" AND " + c for c in _date_conds(dates, ""))
         rows = main.execute(f"SELECT id, documentKey, typeKey, sequence, name FROM items WHERE {where}",
                             ids).fetchall()
     finally:
@@ -1299,10 +1692,11 @@ def _join_items(proj_id, ids, type_arg):
     return {r["id"]: r for r in rows}
 
 
-def semantic_search(proj_id, query, top=0, type_arg=None, max_distance=VEC_MAX_DISTANCE):
-    """Pure vector search: every item within the cosine-distance threshold, nearest first. top=0 = no cap."""
+def semantic_search(proj_id, query, top=0, type_arg=None, max_distance=VEC_MAX_DISTANCE, dates=None):
+    """Pure vector search: every item within the cosine-distance threshold, nearest first. top=0 = no cap.
+    `dates` (created/modified range) is applied when folding chunk hits back to items."""
     hits = _semantic_ids(proj_id, query, max_distance)  # distance <= max_distance
-    by_id, cos, out = _join_items(proj_id, [i for i, _ in hits], type_arg), dict(hits), []
+    by_id, cos, out = _join_items(proj_id, [i for i, _ in hits], type_arg, dates), dict(hits), []
     for iid, _ in hits:
         if iid in by_id:
             if top and len(out) >= top:
@@ -1313,18 +1707,21 @@ def semantic_search(proj_id, query, top=0, type_arg=None, max_distance=VEC_MAX_D
     return out
 
 
-def hybrid_search(proj_id, query_text, keywords, match="any", field="all", top=0, type_arg=None,
-                  max_distance=VEC_MAX_DISTANCE):
+def hybrid_search(proj_id, query_text, ast, field="all", top=0, type_arg=None,
+                  max_distance=VEC_MAX_DISTANCE, dates=None):
     """DEFAULT content search: UNION of FTS (keyword/BM25) + LIKE (substring) + semantic (vector, thresholded
-    at cosine distance <= max_distance), fused by Reciprocal Rank Fusion and de-duped by item id. Each leg
-    returns ALL its matches (no cap); top=0 returns the whole fused union. `via` = which legs matched."""
+    at cosine distance <= max_distance), fused by Reciprocal Rank Fusion and de-duped by item id. The FTS +
+    LIKE legs honour the boolean `ast` (AND/OR/NOT + parens); the vector leg uses `query_text` (meaning-
+    search can't express boolean logic). An optional `dates` (created/modified range) filters all legs.
+    Each leg returns ALL its matches (no cap); top=0 returns the whole fused union. `via` = which legs
+    matched."""
     con = open_db(proj_id)
     try:
-        legs = {"fts": _fts_ids(con, keywords, match, field),
-                "like": _like_ids(con, keywords, match, field)}
+        legs = {"fts": _fts_ids(con, ast, field, dates),
+                "like": _like_ids(con, ast, field, dates)}
     finally:
         con.close()
-    legs["vec"] = [i for i, _ in _semantic_ids(proj_id, query_text, max_distance)]
+    legs["vec"] = [i for i, _ in _semantic_ids(proj_id, query_text, max_distance)] if query_text else []
     fused, srcs = {}, {}
     for leg, ids in legs.items():
         for rank, iid in enumerate(ids):
@@ -1332,7 +1729,7 @@ def hybrid_search(proj_id, query_text, keywords, match="any", field="all", top=0
             srcs.setdefault(iid, set()).add(leg)
     if not fused:
         return []
-    by_id = _join_items(proj_id, list(fused.keys()), type_arg)
+    by_id = _join_items(proj_id, list(fused.keys()), type_arg, dates)
     ranked = sorted((i for i in fused if i in by_id), key=lambda i: -fused[i])
     if top:
         ranked = ranked[:top]
@@ -1428,14 +1825,47 @@ def type_clause(type_arg):
     return "(" + " OR ".join(parts) + ")" if parts else ""
 
 
+# Dates are stored as ISO-8601 text (e.g. 2026-06-18T09:59:23.000+0000), so lexicographic compare ==
+# chronological compare. Filtering is inclusive on both ends. A bare YYYY-MM-DD upper bound is widened with
+# a 'T99' sentinel (> any real 'THH..' time) so "--*-before 2026-06-30" includes ALL of the 30th.
+_DATE_INPUT_RE = re.compile(r"^\d{4}-\d{2}-\d{2}([T ].*)?$")
+
+
+def _date_conds(dates, alias=""):
+    """SQL conditions for an optional created/modified range. `dates` = (created_after, created_before,
+    modified_after, modified_before) already normalized, or None. `alias` (e.g. 'i.') prefixes the column
+    when the query joins items under an alias. Returns a list of SQL strings (each a single condition)."""
+    if not dates:
+        return []
+    ca, cb, ma, mb = dates
+    out = []
+    if ca:
+        out.append(f"{alias}createdDate >= {sql_lit(ca)}")
+    if cb:
+        out.append(f"{alias}createdDate <= {sql_lit(cb)}")
+    if ma:
+        out.append(f"{alias}modifiedDate >= {sql_lit(ma)}")
+    if mb:
+        out.append(f"{alias}modifiedDate <= {sql_lit(mb)}")
+    return out
+
+
+def norm_dates(a):
+    """Build the (created_after, created_before, modified_after, modified_before) tuple from CLI args,
+    validating the format and widening bare-date upper bounds to include the whole day. None if unset."""
+    raw = {k: getattr(a, k, None) for k in
+           ("created_after", "created_before", "modified_after", "modified_before")}
+    for k, v in raw.items():
+        if v and not _DATE_INPUT_RE.match(v):
+            sys.exit(f"Invalid --{k.replace('_', '-')} {v!r}: expected YYYY-MM-DD (optionally 'THH:MM:SS').")
+    day_end = lambda v: v + "T99" if (v and re.fullmatch(r"\d{4}-\d{2}-\d{2}", v)) else v
+    dates = (raw["created_after"], day_end(raw["created_before"]),
+             raw["modified_after"], day_end(raw["modified_before"]))
+    return dates if any(dates) else None
+
+
 def keywords_of(values):
     return [k for v in (values or []) for k in (x.strip() for x in v.split(",")) if k]
-
-
-def fts_query(keywords, match):
-    """Compose an FTS5 MATCH string from keywords. Phrases are quoted; joined by OR/AND."""
-    terms = ['"' + k.replace('"', '""') + '"' for k in keywords]
-    return (" AND " if match == "all" else " OR ").join(terms)
 
 
 # ============================ result rendering ============================
@@ -1535,20 +1965,32 @@ def cmd_status(a):
 
 
 def cmd_search(a):
-    # DEFAULT = hybrid (LIKE + keyword/FTS + semantic, RRF-fused, de-duped) per spec point 4.
+    # DEFAULT = hybrid (LIKE + keyword/FTS + semantic, RRF-fused, de-duped) per spec point 4. The FTS+LIKE
+    # legs honour a boolean keyword AST: --expr "(a or b) and not c" (explicit), or --keyword a,b + --match
+    # (flat OR/AND). The vector leg uses --query (or the positive leaf terms) for meaning-based recall.
     keywords = keywords_of(a.keyword)
-    query_text = " ".join(a.query) if a.query else " ".join(keywords)
-    if a.query and not keywords:
-        keywords = keywords_of(a.query)  # feed the FTS/LIKE legs from the query words too
-    if not query_text:
-        sys.exit('search needs --keyword a,b or --query "natural language text".')
+    expr = " ".join(a.expr) if getattr(a, "expr", None) else None
+    if expr:
+        try:
+            ast = parse_bool_expr(expr)
+        except ValueError as e:
+            sys.exit(f'Could not parse --expr "{expr}": {e}.  Example: "(dock or cradle) and not legacy".')
+    else:
+        if not keywords and a.query:
+            keywords = keywords_of(a.query)  # feed the FTS/LIKE legs from the query words too (as before)
+        ast = ast_from_keywords(keywords, a.match)
+    # vector-leg text: explicit --query, else the positive leaf terms of the AST
+    query_text = " ".join(a.query) if a.query else (" ".join(bool_terms(ast)) if ast is not None else "")
+    if ast is None and not query_text:
+        sys.exit('search needs --keyword a,b , --expr "(a or b) and c" , or --query "natural language text".')
     md = a.max_distance if a.max_distance is not None else VEC_MAX_DISTANCE
+    dates = norm_dates(a)  # optional created/modified range filter (applied to every leg)
     pr = single_project(a.project)
     ensure_synced(pr["id"], pr["name"], force=a.force, offline=a.offline, quiet=True,
                   concurrency=a.concurrency, want_vectors=True)
     t = time.time()
-    rows = hybrid_search(pr["id"], query_text, keywords, match=a.match, field=a.field,
-                         top=a.top, type_arg=a.type, max_distance=md)
+    rows = hybrid_search(pr["id"], query_text, ast, field=a.field,
+                         top=a.top, type_arg=a.type, max_distance=md, dates=dates)
     ms = int((time.time() - t) * 1000)
     emit_rows(rows, a.json, f"{len(rows)} hybrid match(es) [FTS+LIKE+vector; vec sim>={1-md:.2f}] in {ms} ms   "
                             f"[offline cache: {pr['id']} {pr['name']}]")
@@ -1576,12 +2018,13 @@ def cmd_semantic(a):
     if not q:
         sys.exit('semantic needs --query "natural language text", e.g. --query "headset won\'t charge on the cradle"')
     md = a.max_distance if a.max_distance is not None else VEC_MAX_DISTANCE
+    dates = norm_dates(a)  # optional created/modified range filter
     pr = single_project(a.project)
     # ensure main cache fresh AND the vector index exists/updated (want_vectors=True)
     ensure_synced(pr["id"], pr["name"], force=a.force, offline=a.offline, quiet=True,
                   concurrency=a.concurrency, want_vectors=True)
     t = time.time()
-    rows = semantic_search(pr["id"], q, top=a.top, type_arg=a.type, max_distance=md)
+    rows = semantic_search(pr["id"], q, top=a.top, type_arg=a.type, max_distance=md, dates=dates)
     ms = int((time.time() - t) * 1000)
     emit_rows(rows, a.json, f"{len(rows)} semantic match(es) [cosine sim >= {1-md:.2f}] in {ms} ms via "
                             f"{EMBED_MODEL}   [offline cache: {pr['id']} {pr['name']}]")
@@ -1675,6 +2118,9 @@ def build_parser():
         sp.add_argument("--all", action="store_true")
         if name == "search":
             sp.add_argument("--keyword", action="append", help="keyword(s), comma-separated")
+            sp.add_argument("--expr", action="append",
+                            help='boolean keyword expression for the FTS+LIKE legs: AND/OR/NOT + parentheses,'
+                                 ' e.g. "(dock or cradle) and (charge or power) and not legacy"')
             sp.add_argument("--query", action="append", help="natural-language text (drives the vector leg)")
             sp.add_argument("--match", choices=["any", "all"], default="any")
             sp.add_argument("--field", choices=["name", "all"], default="all")
@@ -1688,6 +2134,15 @@ def build_parser():
             sp.add_argument("--top", type=int, default=0, help="cap rows (0 = no cap)")
             sp.add_argument("--max-distance", type=float, default=None, dest="max_distance",
                             help=f"vector cosine-distance ceiling (default {VEC_MAX_DISTANCE}; lower = stricter)")
+        if name in ("search", "semantic"):  # created/modified date-range filters (inclusive)
+            sp.add_argument("--created-after", dest="created_after", default=None, metavar="DATE",
+                            help="keep items with createdDate >= DATE (YYYY-MM-DD or full ISO)")
+            sp.add_argument("--created-before", dest="created_before", default=None, metavar="DATE",
+                            help="keep items with createdDate <= DATE (a bare date includes the whole day)")
+            sp.add_argument("--modified-after", dest="modified_after", default=None, metavar="DATE",
+                            help="keep items with modifiedDate >= DATE")
+            sp.add_argument("--modified-before", dest="modified_before", default=None, metavar="DATE",
+                            help="keep items with modifiedDate <= DATE (a bare date includes the whole day)")
         if name == "query":
             sp.add_argument("--sql", default=None)
         if name == "login":

@@ -11,6 +11,11 @@ only vector search needs `fastembed` + `sqlite-vec` (auto-installed on first use
 - 🔎 **Hybrid search** — FTS5/BM25 + substring (LIKE) + semantic (vector),
   fused by Reciprocal Rank Fusion (RRF) and de-duplicated. All three legs cover
   an item's **name, description, and test-case steps**.
+- 🧮 **Boolean expressions** — `--expr "(dock or cradle) and (charge or power) and not legacy"`
+  (AND/OR/NOT + parentheses; full-width `（）` and symbol operators accepted) drives
+  the keyword + substring legs precisely.
+- 📅 **Date-range filters** — `--created-after/-before` and `--modified-after/-before`
+  (inclusive) on `search` and `semantic`.
 - 🧠 **Semantic search** — meaning-based matching (paraphrases / synonyms)
   via `BAAI/bge-base-en-v1.5` embeddings. Long text is embedded in **overlapping
   chunks (no truncation)**, so even long test cases are searchable end to end.
@@ -18,6 +23,11 @@ only vector search needs `fastembed` + `sqlite-vec` (auto-installed on first use
   exact counts, filters, joins.
 - ⚡ **Persistent + auto-syncing cache** — full download once, then every
   query pulls only items changed since last run (seconds).
+- 🇨🇳 **China-first downloads + progress** — pip deps and the embedding model
+  are fetched from a China mirror chosen by a **live speed test** (Tsinghua /
+  Aliyun / Tencent · `hf-mirror.com`), falling back to the international source and
+  aborting if neither is fast enough. Every long download/build streams **periodic
+  progress** to stderr. (Jama API traffic is never rerouted.)
 - 🌐 **Cross-platform** — Windows / Linux / macOS, Python 3.8+, standard
   library only for the core.
 
@@ -33,6 +43,10 @@ python jama_offline.py projects --project projecta
 
 # 3. Hybrid search (keyword + substring + semantic)
 python jama_offline.py search --project 12345 --keyword docking --type REQ
+
+# 3b. Boolean expression + date range
+python jama_offline.py search --project 12345 \
+    --expr "(dock or cradle) and not legacy" --created-after 2026-01-01
 
 # 4. Semantic search (meaning-based)
 python jama_offline.py semantic --project 12345 --query "headset won't charge"
@@ -77,9 +91,10 @@ the existing cache as-is (no network or credentials; errors if no cache exists y
 - Python 3.8+
 - Core (`projects` / `query` / `status`): standard library only.
 - Vector search (`search` / `semantic`): `fastembed` + `sqlite-vec`
-  (auto-installed on first use). First run does a one-time ~200 MB model download
-  and builds the chunked index (~30–35 min for a 10k-item project on CPU);
-  afterwards only changed items are re-embedded (seconds).
+  (auto-installed on first use, China-mirror-first). First run does a one-time
+  ~210 MB model download (China-mirror-first, speed-tested) and builds the chunked
+  index (~30–35 min for a 10k-item project on CPU); afterwards only changed items
+  are re-embedded (seconds). Tune the mirror speed cutoff with `JAMA_MIN_KBPS`.
 
 ## License
 
