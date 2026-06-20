@@ -2,16 +2,18 @@
 
 A Copilot CLI skill for **fast offline search of Jama Connect** — download a
 project to a local SQLite cache, then query it in milliseconds with keyword
-(FTS5/BM25), substring, and semantic (vector) search. Pure Python standard
-library for the core; only vector search needs `fastembed` + `sqlite-vec`
-(auto-installed on first use).
+(FTS5/BM25), substring, and semantic (vector) search across each item's **name,
+description, and test-case steps**. Pure Python standard library for the core;
+only vector search needs `fastembed` + `sqlite-vec` (auto-installed on first use).
 
 ## Features
 
 - 🔎 **Hybrid search** — FTS5/BM25 + substring (LIKE) + semantic (vector),
-  fused by Reciprocal Rank Fusion (RRF) and de-duplicated.
+  fused by Reciprocal Rank Fusion (RRF) and de-duplicated. All three legs cover
+  an item's **name, description, and test-case steps**.
 - 🧠 **Semantic search** — meaning-based matching (paraphrases / synonyms)
-  via `BAAI/bge-base-en-v1.5` embeddings.
+  via `BAAI/bge-base-en-v1.5` embeddings. Long text is embedded in **overlapping
+  chunks (no truncation)**, so even long test cases are searchable end to end.
 - 🗄️ **SQL queries** — read-only `SELECT` against the flattened cache for
   exact counts, filters, joins.
 - ⚡ **Persistent + auto-syncing cache** — full download once, then every
@@ -54,6 +56,9 @@ python jama_offline.py query --project 12345 \
 | `rebuild` | Force a clean full re-download (drops deletions). |
 | `purge` | Delete cache file(s). |
 
+Add `--offline` to any `search` / `semantic` / `query` to skip the sync and read
+the existing cache as-is (no network or credentials; errors if no cache exists yet).
+
 ## Files
 
 - `jama_offline.py` — the single script (all commands).
@@ -72,7 +77,9 @@ python jama_offline.py query --project 12345 \
 - Python 3.8+
 - Core (`projects` / `query` / `status`): standard library only.
 - Vector search (`search` / `semantic`): `fastembed` + `sqlite-vec`
-  (auto-installed on first use; one-time ~200 MB model download).
+  (auto-installed on first use). First run does a one-time ~200 MB model download
+  and builds the chunked index (~30–35 min for a 10k-item project on CPU);
+  afterwards only changed items are re-embedded (seconds).
 
 ## License
 
