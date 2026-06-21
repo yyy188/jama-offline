@@ -33,6 +33,16 @@ Commands:
   DELTA_LIMIT (200) items, they STOP with an exact message telling you to run `init` or `update` first. A
   small delta IS auto-synced (bounded). `--offline` serves the existing cache as-is; `--force` overrides.
 
+  PARALLEL USE: before fanning out parallel queries — or parallel agents that each call this script — on the
+  SAME project, you MUST prepare it ONCE first: a single serial `init`/`update` (which also downloads the
+  one-time ~210 MB embedding model, shared by ALL projects, and builds the vectors), then confirm it is
+  caught up (`status`: state=present, vectors=ready), THEN run the parallel workers with `--offline` so each
+  reads the fresh cache and none re-syncs or re-downloads. Otherwise every worker either hits the offline-first
+  gate and STOPs together, or redundantly re-syncs the same delta — and WORST of all, parallel
+  init/update/sync/rebuild with no model yet makes each process download the SAME ~210 MB model at once.
+  Never run init/update/sync/rebuild on one project (or the first-ever build of any project) concurrently —
+  serialize the build, parallelize only the --offline reads.
+
 Storage: per-user dir (override with $JAMA_OFFLINE_DIR): jama-proj-<id>.db (main) + jama-proj-<id>.vec.db
     (vectors) + credentials.json + models/. Windows %LOCALAPPDATA%\\jama-offline · macOS ~/Library/
     Application Support/jama-offline · Linux $XDG_DATA_HOME/jama-offline or ~/.local/share/jama-offline.

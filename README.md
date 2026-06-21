@@ -92,6 +92,13 @@ than 200 items, they STOP with the exact `init` / `update` command to run; a sma
 auto-synced. Add `--offline` to skip the network and read the existing cache as-is (errors
 if a needed file is missing), or `--force` to rebuild on the spot.
 
+**Going parallel?** Before launching parallel queries or parallel agents on a project, prepare it **once,
+serially** — a single `init` / `update`, which also downloads the one-time ~210 MB model and builds the
+vectors — confirm it's caught up (`status`), then run the workers with `--offline`. Otherwise every worker
+either hard-stops at the offline-first gate together, redundantly re-syncs the same delta, or (with no model
+yet) downloads the same ~210 MB model in parallel. Never run `init`/`update`/`rebuild` on one project
+concurrently — serialize the build, parallelize only the `--offline` reads.
+
 ## Files
 
 - `jama_offline.py` — the single script (all commands).

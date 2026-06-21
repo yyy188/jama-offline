@@ -87,6 +87,14 @@ are never stale for an actively-maintained cache. When a query prints "changed �
 limit). To also drop server-side deletions: "清掉已删项" → `update --project <id> --prune-deleted`; "重建 /
 完全刷新" → `rebuild --project <id>` (full clean re-download). First-ever build → `init --project <id>`.
 
+⚡ **Going parallel? Prepare ONCE first.** Before launching **parallel queries** or **parallel agents** on a
+project, you MUST confirm its cache is fully synced AND the embedding model is downloaded — run ONE serial
+`update` (or `init`; this also fetches the one-time ~210 MB model) and verify with `status` — and only THEN
+fan out the workers, each with **`--offline`**. Skipping this just burns resources: the workers either all
+hard-stop at the offline-first gate together, each redundantly re-syncs the SAME delta, or (with no model
+yet) each downloads the SAME ~210 MB model at once. See **"Parallel queries / parallel agents — sync ONCE
+first"** below.
+
 ---
 
 ## Finding data vs counting data — pick the tool that fits (no hard ban)
@@ -161,6 +169,10 @@ starts a long build: if the cache / vector index / embedding model is missing, o
 items**, it STOPS with the exact `init`/`update` command to run. Add **`--offline`** to skip the network
 entirely and use the existing cache as-is (no credentials; for no-signal/air-gapped use; errors if a needed
 file is missing). Add **`--force`** to override the gate and rebuild on the spot.
+
+> ⚠️ **Running MANY at once (parallel queries / parallel agents)?** Don't fan out cold. Prepare the project
+> **once, serially** (`init`/`update` — this also downloads the one-time ~210 MB model), then run the workers
+> with **`--offline`**. See **"Parallel queries / parallel agents — sync ONCE first"** below.
 
 Options use `--flag value`. Lists are comma-separated: `--keyword upload,download`, `--type REQ,FEAT`.
 
@@ -286,6 +298,43 @@ are dropped, and there's no count cap (`--top N` to limit). Tune the cutoff with
   compares a single server item-count and only sweeps ids when a deletion is detected), or
   `rebuild --project <id>` (full clean re-download). `status` shows each cache's last-sync + watermark.
 - For a guaranteed-live single lookup, use the **jama-query** skill.
+
+---
+
+## Parallel queries / parallel agents — sync ONCE first, then fan out
+
+Before running this skill with **parallel queries** (several `search`/`semantic`/`query` processes at once)
+or **parallel agents** (multiple agents that each invoke this skill) against the **same project**, you
+**MUST first verify the cache is fully synced AND the embedding model is already downloaded** — with a
+single, serial step — and only then fan out. This is a hard precondition, not a nicety: fanning out onto an
+un-prepared cache/model costs time / network / CPU for zero benefit.
+
+**Why it's wasteful.** Every `search`/`semantic`/`query` is offline-first and prepares itself on its own.
+Fan out N workers onto an un-prepared project and you get one of these bad outcomes:
+- **Cold / missing cache / drifted >200 items / vector index lagging / embedding model not downloaded** →
+  all N workers independently hit the offline-first gate and STOP with the *same* `init`/`update` message.
+  N identical hard-stops, no results.
+- **Small pending delta (≤200)** → all N workers try to sync the *same* delta at once: N redundant page
+  downloads, N FTS rebuilds, N vector re-embeds, all contending for the one cache file. It stays correct
+  (per-process temp file + atomic swap), but it's pure duplicated work.
+- **Parallel `init`/`update`/`sync`/`rebuild` with no model yet** → the WORST case: each process downloads
+  the SAME one-time **~210 MB embedding model** concurrently — an N× bandwidth blow-up (and N racing writes
+  into the shared `models/` dir) for a file that only ever needs to be fetched once.
+
+**Required sequence:**
+1. **Prepare once, serially.** `update --project <id>` (never built yet → `init`; to also drop server-side
+   deletions → `update --prune-deleted`). This is what downloads the **~210 MB model** (one-time, shared by
+   ALL projects) and builds/refreshes the vectors. Let it finish.
+2. **Confirm it's caught up.** `status --project <id>` shows `state=present` and `vectors=ready` (a ready
+   vector index implies the model is present), and a second `update` reports nothing changed (delta 0).
+3. **Now fan out — pass `--offline` to EVERY parallel worker** so each reads the already-fresh cache
+   directly and none of them re-syncs or re-downloads anything. `--offline` needs no credentials and never
+   touches the network.
+
+**Also:** never let two processes run `init` / `update` / `sync` / `rebuild` on the **same** project — or the
+first-ever build of ANY project, which fetches the shared model — concurrently. Serialize the build, then
+parallelize only the read-only `--offline` queries. Different projects are independent once the model exists:
+prepare each one once, then fan out per project.
 
 ---
 
