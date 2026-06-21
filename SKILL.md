@@ -20,7 +20,7 @@ Download Jama project(s) → local SQLite → query offline in milliseconds, wit
 Python (standard library only), runs on Windows / Linux / macOS. This file tells you EXACTLY what to run —
 follow the steps in order; when in doubt, copy a template and change only the project and the query.
 
-One script: **`jama_offline.py`** (commands: `projects, sync, rebuild, status, search, query, purge`).
+One script: **`jama_offline.py`** (commands: `projects, init, update, sync, rebuild, status, search, query, purge`).
 
 ---
 
@@ -30,17 +30,23 @@ One script: **`jama_offline.py`** (commands: `projects, sync, rebuild, status, s
 # Replace SKILL_DIR with this skill's folder (the harness gives it as the "Base directory"). Use python3 on Linux/mac.
 python "SKILL_DIR/jama_offline.py" login --base https://example.jamacloud.com --client-id <ID> --client-secret <SECRET>  # once
 python "SKILL_DIR/jama_offline.py" projects --project projecta
+python "SKILL_DIR/jama_offline.py" init     --project 12345                     # ONE-TIME: full download + vector index (~30-50 min)
 python "SKILL_DIR/jama_offline.py" search   --project 12345 --keyword docking --type REQ
 python "SKILL_DIR/jama_offline.py" semantic --project 12345 --query "headset won't charge on the cradle"
 python "SKILL_DIR/jama_offline.py" query    --project 12345 --sql "SELECT typeKey, COUNT(*) c FROM items GROUP BY typeKey"
+python "SKILL_DIR/jama_offline.py" update   --project 12345                     # when a query says the cache drifted
 ```
 - **`login` once** — credentials are saved to a user-level file and reused automatically (no re-login). If
   creds are already set (env or a prior login), skip it.
-- You normally do NOT run `sync` yourself — `search`/`query` download on first use then incrementally sync
-  changed items before every run (seconds). `search` is HYBRID (keyword + substring + semantic, fused).
-- **First `search`/`semantic`** auto-installs vector deps (`fastembed`/`sqlite-vec`) + builds the index
-  (~30-35 min one-time, progress bar). `semantic` = the pure-vector variant. `projects`/`query` need no extras.
-  Deps + the model download **China-mirror-first with a live speed test + progress** (see "Downloads" below).
+- **`init` once per project** — `search`/`semantic`/`query` are OFFLINE-FIRST and **never silently kick off a
+  long build**. The FIRST time you touch a project you run `init` (full download + vector index + one-time
+  ~210 MB model). After that, a query auto-syncs only a SMALL delta; if the project has drifted by **more than
+  200 changed items** (or its vector index lags that far), the query **STOPS and tells you to run `update`**.
+  If there's no cache/vector/model at all, it STOPS and tells you to run `init`. (See "Decision flow" below.)
+- `init`/`update` install the vector deps (`fastembed`/`sqlite-vec`) + build/maintain the index (~30-35 min
+  one-time build, **streamed in low-memory waves**, progress bar). `search` is HYBRID (keyword + substring +
+  semantic, fused); `semantic` = the pure-vector variant. `projects`/`query` need no vector extras. Deps + the
+  model download are **China-mirror-first with a live speed test + progress** (see "Downloads" below).
 
 ---
 
@@ -60,19 +66,26 @@ python "SKILL_DIR/jama_offline.py" query    --project 12345 --sql "SELECT typeKe
    - **DON'T guess a project id.** Always resolve it with `projects` first.
    - **STOP and ask the user** if `projects` returns **0 matches**, or **more than 5**, or you genuinely
      **can't tell which project** they mean. Show candidates; never silently pick one.
-2. **Search.** `search --project <id> --keyword <words>` (or `--query "natural language"`). This is a
+2. **Build it once (`init`).** A query needs a local cache + (for search/semantic) a vector index + the
+   embedding model. If any is missing the query STOPS and tells you to run **`init --project <id>`** (one-time
+   full download + ~30-50 min vector build, streamed in low-memory waves with a progress bar). Run it once;
+   afterwards skip straight to step 3. (`init` on an already-built project is a no-op that just says so.)
+3. **Search.** `search --project <id> --keyword <words>` (or `--query "natural language"`). This is a
    **HYBRID** search — keyword (FTS5/BM25) **+** substring (LIKE) **+** semantic (vector), fused by RRF and
    de-duped, so one query returns the most complete set. The `via` column shows which legs matched; `score`
-   is the fused rank. Add `--type REQ` (or FEAT/TC…) to limit kinds. (First use auto-installs the vector
-   deps + builds the index — one-time, see the semantic section.)
-3. **Stats / aggregation → usually `query` (SQL)** for exact, reproducible numbers (`COUNT` / `GROUP BY` /
+   is the fused rank. Add `--type REQ` (or FEAT/TC…) to limit kinds. Before serving, the query auto-syncs a
+   small delta; if the cache (or its vector index) has drifted by **>200 items** it STOPS and asks you to run
+   `update` first.
+4. **Stats / aggregation → usually `query` (SQL)** for exact, reproducible numbers (`COUNT` / `GROUP BY` /
    exact `WHERE`). For *semantic* counts ("how many are about X"), `semantic` works too — its count is
    `--max-distance`-dependent, so report it as approximate. (See "Finding data vs counting data".)
-4. **Report** the `documentKey` + `name` (+ sequence) rows back to the user.
+5. **Report** the `documentKey` + `name` (+ sequence) rows back to the user.
 
-Data auto-updates: each search/query first syncs items changed since last time. To also drop server-side
-deletions: "清掉已删项" → `sync --project <id> --prune-deleted` (lightweight, keeps the cache); "重建 /
-完全刷新" → `rebuild --project <id>` (full clean re-download).
+Keeping data fresh: a query auto-syncs only a SMALL delta (≤200 changed items) before returning — results
+are never stale for an actively-maintained cache. When a query prints "changed … over the 200-item limit" or
+"not yet in the vector index", run **`update --project <id>`** (incremental, streamed low-memory, no size
+limit). To also drop server-side deletions: "清掉已删项" → `update --project <id> --prune-deleted`; "重建 /
+完全刷新" → `rebuild --project <id>` (full clean re-download). First-ever build → `init --project <id>`.
 
 ---
 
@@ -102,8 +115,9 @@ measurement** tool. Either is allowed for any goal — just know the trade-off:
   "Base directory". Use THAT exact path, verbatim. It differs on every machine/user/OS (drive, username,
   home dir, `/` vs `\`), so **never hard-code a path or copy one from an example or another machine.**
 - Do **not** write the literal text `SKILL_DIR` — substitute the real Base directory.
-- **Core** (projects/search/query/sync/status) = Python **standard library only**, no pip. **Only**
-  `semantic` (vector search) needs extras: `pip install fastembed sqlite-vec` + a one-time model download.
+- **Core** (projects/query/status) = Python **standard library only**, no pip. `search`/`semantic` (vector
+  search) and the `init`/`update`/`sync`/`rebuild` vector build need extras: `pip install fastembed
+  sqlite-vec` + a one-time model download (auto-installed on the first build).
 
 ---
 
@@ -131,18 +145,22 @@ fetched **China-mirror-first**, decided by a quick **live speed test** before do
 |---------|--------------|
 | `login --base <url> --client-id <id> --client-secret <s>` | Save credentials once to a user-level file (validated by fetching a token). `logout` removes them. |
 | `projects --project <name/regex>` | List matching projects → get the **id**. Step 1, always. |
-| `search --project <id> --keyword a,b` | **Main tool. HYBRID** = FTS + LIKE + semantic, RRF-fused & de-duped. Auto-syncs + auto-builds vectors. Supports `--expr "(a or b) and not c"` (boolean) and `--created-/--modified-after/-before` date filters. |
-| `semantic --project <id> --query "…"` | **Meaning-based** (vector) search; finds paraphrases/synonyms. Needs vector extras (see below). |
-| `query --project <id> --sql "SELECT ..."` | Read-only SQL for counts/filters/joins. Auto-syncs. |
+| `init --project <id>` | **FIRST-TIME setup:** full download + vector index + one-time model. No-op (with a hint) if a cache already exists. Run once per project before querying. |
+| `update --project <id>` | **Incrementally update** an existing cache + its vector index (streamed, low-memory, no size limit). `--no-vectors` to skip vectors; `--prune-deleted` to also drop server-deleted items. Run this when a query says the cache drifted. |
+| `search --project <id> --keyword a,b` | **Main query. HYBRID** = FTS + LIKE + semantic, RRF-fused & de-duped. Offline-first: STOPs if the cache/vector/model is missing or the delta is >200 (telling you to run `init`/`update`); else auto-syncs the small delta. Supports `--expr "(a or b) and not c"` (boolean) and `--created-/--modified-after/-before` date filters. |
+| `semantic --project <id> --query "…"` | **Meaning-based** (vector) search; finds paraphrases/synonyms. Same offline-first gate as `search`. |
+| `query --project <id> --sql "SELECT ..."` | Read-only SQL for counts/filters/joins. Offline-first: STOPs if no cache or the delta is >200; else auto-syncs the small delta. No vector deps needed. |
 | `status` | Show what's cached: state, last-sync, watermark, size, vector-index state. |
-| `rebuild --project <id>` | Force a clean FULL re-download (also drops deleted items). (aliases: `refresh`, `update`) |
-| `sync --project <id>` | Build/incrementally-update a cache (+ its vector index). `--no-vectors` to skip vectors. `--prune-deleted` to also remove server-deleted items. |
+| `rebuild --project <id>` | Force a clean FULL re-download (also drops deleted items). (alias: `refresh`) |
+| `sync --project <id>` | Build-if-missing else incremental (init + update in one). `--no-vectors` to skip vectors. `--prune-deleted` to also remove server-deleted items. |
 | `purge --project <id>` / `--all` | Delete cache file(s) (incl. the vector index). |
 
-Every `search`/`semantic`/`query` ALWAYS checks the cache first and syncs the latest changes before
-returning (with a download progress bar if a full download is needed) — results are never stale. Add
-**`--offline`** to skip the sync and use the existing cache as-is (no network/credentials; for no-signal
-or air-gapped use). It errors if there's no cache yet (that first build needs the network).
+Every `search`/`semantic`/`query` is **offline-first**: it checks the cache first, auto-syncs only a SMALL
+delta (≤200 changed items) and serves — results are never stale for a maintained cache. It NEVER silently
+starts a long build: if the cache / vector index / embedding model is missing, or the delta exceeds **200
+items**, it STOPS with the exact `init`/`update` command to run. Add **`--offline`** to skip the network
+entirely and use the existing cache as-is (no credentials; for no-signal/air-gapped use; errors if a needed
+file is missing). Add **`--force`** to override the gate and rebuild on the spot.
 
 Options use `--flag value`. Lists are comma-separated: `--keyword dock,cradle`, `--type REQ,FEAT`.
 
@@ -234,14 +252,17 @@ Returns **every** item with **cosine similarity >= 0.70** (distance <= 0.30) —
 are dropped, and there's no count cap (`--top N` to limit). Tune the cutoff with **`--max-distance D`**
 (default 0.30; `0.20` stricter, `0.45` looser). `semantic` is the pure-vector variant; `search` is hybrid.
 
-- **Vectors are required & auto-installed:** if `fastembed`/`sqlite-vec` are missing, the first run
-  **auto-runs `pip install fastembed sqlite-vec`** (one-time) — no degraded fallback.
-- **One-time index build:** the first `search`/`semantic`/`sync`/`rebuild` splits every item's
+- **Vectors are required & auto-installed:** if `fastembed`/`sqlite-vec` are missing, `init`/`update`
+  **auto-run `pip install fastembed sqlite-vec`** (one-time) — no degraded fallback.
+- **One-time index build (`init`):** `init` (or `update`/`sync`/`rebuild`) splits every item's
   name+description+steps into overlapping chunks and embeds each with `BAAI/bge-base-en-v1.5` (768-d) →
-  a separate `jama-proj-<id>.vec.db`. This is the slow part: **downloads
-  a ~210 MB model once** (China-mirror-first, speed-tested — see "Downloads"), **then ~30–35 min for a
-  10k-item project on CPU** (a progress bar with %/ETA shows on stderr). Uses ~80% of CPU threads. After
-  that, incremental syncs only re-embed *changed* items (seconds), and each query is milliseconds.
+  a separate `jama-proj-<id>.vec.db`. The build is **STREAMED in low-memory waves** (it reads the item ids,
+  then fetches→chunks→embeds→inserts ~200 items at a time and frees each wave), so peak memory stays small on
+  any project size. This is the slow part: **downloads a ~210 MB model once** (China-mirror-first,
+  speed-tested — see "Downloads"), **then ~30–45 min for a 10k-item project on CPU** (a time-based progress
+  bar shows on stderr). Uses ~80% of CPU threads. After that, `update` (and a query's small auto-sync) only
+  re-embeds *changed* items (seconds), and each query is milliseconds. A `search`/`semantic` on a project
+  with no index does NOT build it — it STOPS and tells you to run `init`.
 
 ---
 
@@ -252,13 +273,15 @@ are dropped, and there's no count cap (`--top N` to limit). Tune the cutoff with
   Linux `$XDG_DATA_HOME/jama-offline` or `~/.local/share/jama-offline`. Per project: `jama-proj-<id>.db`
   (main) + optional `jama-proj-<id>.vec.db` (vectors). Saved credentials: `credentials.json` in the same
   dir; the embedding model: `models/`.
-- **No expiry, never auto-deleted.** A cache is built once (full download), then **every `search` /
-  `semantic` / `query` ALWAYS checks the cache first and pulls just the items changed since last time**
-  (by `modifiedDate`) before returning — a tiny delta (~1–3 s when little changed, vs ~60 s full). Forced
-  by default, so results are never stale; pass **`--offline`** to skip it and read the existing cache with
-  no network/credentials (errors if no cache exists yet).
+- **No expiry, never auto-deleted.** A cache is built once with **`init`** (full download), then **every
+  `search` / `semantic` / `query` checks the cache first and auto-syncs just the items changed since last
+  time** (by `modifiedDate`) before returning — a tiny delta (~1–3 s). BUT this auto-sync is **bounded to
+  ≤200 changed items**: if more changed (or the vector index lags that far), the query STOPS and asks you to
+  run **`update`** (unbounded + streamed low-memory). It never silently runs a long build. Pass **`--offline`**
+  to skip the sync and read the existing cache as-is (no network/credentials; errors if a needed file is
+  missing), or **`--force`** to rebuild on the spot.
 - **Catches new + changed items. Does NOT catch server-side DELETIONS by default.** Two ways to drop
-  deleted items: **`sync --project <id> --prune-deleted`** (lightweight, opt-in — keeps the cache, just
+  deleted items: **`update --project <id> --prune-deleted`** (lightweight, opt-in — keeps the cache, just
   removes items deleted on the server from both the cache AND the vector index; cheap because it first
   compares a single server item-count and only sweeps ids when a deletion is detected), or
   `rebuild --project <id>` (full clean re-download). `status` shows each cache's last-sync + watermark.
@@ -270,8 +293,8 @@ are dropped, and there's no count cap (`--top N` to limit). Tune the cutoff with
 
 Copy the whole `jama-offline` folder. Then:
 1. **Python 3.8+** on Windows / Linux / macOS. `projects`/`query`/`status` use only the standard library;
-   `search`/`semantic` need `fastembed` + `sqlite-vec`, which the tool **auto-installs on first use**
-   (one-time pip). First vector build also downloads a ~200 MB model.
+   `search`/`semantic` (and the `init`/`update` vector build) need `fastembed` + `sqlite-vec`, which the tool
+   **auto-installs on the first build** (one-time pip). The first build also downloads a ~200 MB model.
 2. **Credentials** — needed to download/refresh (every query syncs first, so they're effectively required).
    Easiest:
    **`jama_offline.py login --base <url> --client-id <id> --client-secret <secret>`** once → saved to a
@@ -291,6 +314,11 @@ Copy the whole `jama-offline` folder. Then:
 | `resolves to N projects (max 5)` | Name matched too many | STOP. Show candidates, ask user to pick/narrow. |
 | `No project name matches /…/` | Name matched nothing | Try a different word, or ask for the exact name. |
 | `needs exactly ONE project` | search/query got >1 project | Re-run with a single id. |
+| `no offline cache yet … init` | Querying a project never built locally | Run `init --project <id>` once (full download + vector build). |
+| `no vector index … update` / `model is not downloaded … update` | search/semantic but the vector index or embedding model is missing | Run `update --project <id>` (builds vectors / fetches the model). |
+| `changed on the server … over the 200-item … update` | The cache drifted by >200 items | Run `update --project <id>`, then re-run the query. |
+| `not yet in the vector index … update` | The vector index lags the cache by >200 items | Run `update --project <id>`, then re-run. |
+| `unreadable or built by an older schema … rebuild` | Corrupt / old-schema cache | Run `rebuild --project <id>`. |
 | `Only read-only SELECT…allowed` | Non-SELECT SQL passed to `query` | Rewrite as `SELECT`/`WITH`. |
 | `fts5: syntax error` (internal) | Odd characters in a keyword | The FTS leg is auto-skipped; LIKE+vector still run. Simplify keywords if needed. |
 | `Missing credentials` | No Jama API keys found | Run `login` once (see Portability), or set env vars. |
@@ -300,9 +328,10 @@ Copy the whole `jama-offline` folder. Then:
 | `Could not parse --expr` | Malformed boolean expression | Balance the parens; use `and`/`or`/`not`; quote phrases with spaces. |
 | `Login FAILED` | Wrong base/id/secret (token call 401) | Re-check the three values; nothing is saved on failure. |
 
-First `search`/`semantic` on a NEW project also builds the vector index (~30–35 min, progress bar) + a
-one-time ~200 MB model download + full data download. Expected, not a hang. After that each
-run does only a small incremental sync (seconds) before returning.
+A NEW project is built by **`init`** (~30–50 min: full data download + a one-time ~200 MB model + the
+low-memory streamed vector build, progress bar). Expected, not a hang. `search`/`semantic`/`query` never
+trigger this themselves — they STOP and point you to `init`. After the build, each query does only a small
+bounded incremental sync (seconds) before returning, and `update` keeps it current.
 
 ---
 
@@ -330,12 +359,12 @@ extension to read:
 - **`chunk_map(chunk_id, item_id)`** — folds a chunk hit back to its owning item (join on `chunk_id`,
   then keep the nearest chunk per item).
 - **`vmeta(key, value)`** — `embed_model`, `dim`, `vec_count` (chunks), `item_count`, `built_at`,
-  `vec_watermark` (newest `modifiedDate` whose vectors are current; each `search`/`semantic` re-embeds
-  items changed past it, so the index never lags — even items a vectors-less `query` synced). Readable
-  without the extension.
+  `vec_watermark` (newest `modifiedDate` whose vectors are current; a query's bounded auto-sync — or
+  `update` — re-embeds items changed past it, **streamed in low-memory waves**; if the lag exceeds 200 items
+  a query stops and asks for `update`). Readable without the extension.
 
 List a project's custom fields: `query --project <id> --sql "SELECT DISTINCT key FROM fields_kv ORDER BY key"`.
 
 ## jama-offline vs jama-query
-- **jama-offline (this):** named project(s); repeated/complex queries; keyword (FTS/substring) **and semantic (vector)** search; status/custom-field/SQL; persistent cache auto-synced each use (deletions need `rebuild`); cross-platform Python.
+- **jama-offline (this):** named project(s); repeated/complex queries; keyword (FTS/substring) **and semantic (vector)** search; status/custom-field/SQL; persistent cache built once with `init`, bounded auto-sync each use (big drifts → `update`, deletions → `update --prune-deleted` or `rebuild`); cross-platform Python.
 - **jama-query (sibling):** single always-live lookup, or online navigation (`tree`, `children`, `trace`) across the instance.

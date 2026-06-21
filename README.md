@@ -21,13 +21,16 @@ only vector search needs `fastembed` + `sqlite-vec` (auto-installed on first use
   chunks (no truncation)**, so even long test cases are searchable end to end.
 - 🗄️ **SQL queries** — read-only `SELECT` against the flattened cache for
   exact counts, filters, joins.
-- ⚡ **Persistent + auto-syncing cache** — full download once, then every
-  query pulls only items changed since last run (seconds).
-- 🧵 **Streaming, low-memory build** — the full download is written to a
-  per-process temp DB **wave by wave** (committed and freed each batch), so peak
-  memory stays bounded (~`concurrency × page`) regardless of project size, then
-  atomically swapped into place. Concurrent downloads use distinct temp files and
-  the last atomic swap wins — no clash, no torn cache.
+- ⚡ **Persistent cache, offline-first queries** — build once with `init`, then
+  every query auto-syncs only a SMALL delta (≤200 changed items) and serves in
+  milliseconds. If the cache / vector index / model is missing, or the project has
+  drifted past 200 items, the query **STOPS with the exact `init` / `update` command
+  to run** — it never silently kicks off a long download/build.
+- 🧵 **Streaming, low-memory build** — the full data download, the incremental
+  sync, **and the vector (re)build** all run **wave by wave** (fetch → process →
+  commit → free each batch), so peak memory stays bounded regardless of project
+  size, then the result is atomically swapped into place. Concurrent builds use
+  distinct temp files and the last atomic swap wins — no clash, no torn cache.
 - 🇨🇳 **China-first downloads + progress** — pip deps and the embedding model
   are fetched from a China mirror chosen by a **live speed test** (Tsinghua /
   Aliyun / Tencent · `hf-mirror.com`), falling back to the international source and
@@ -46,19 +49,25 @@ python jama_offline.py login --base https://example.jamacloud.com \
 # 2. Find the project id by name
 python jama_offline.py projects --project projecta
 
-# 3. Hybrid search (keyword + substring + semantic)
+# 3. Build the local cache ONCE (full download + vector index; ~30-50 min one-time)
+python jama_offline.py init --project 12345
+
+# 4. Hybrid search (keyword + substring + semantic)
 python jama_offline.py search --project 12345 --keyword docking --type REQ
 
-# 3b. Boolean expression + date range
+# 4b. Boolean expression + date range
 python jama_offline.py search --project 12345 \
     --expr "(dock or cradle) and not legacy" --created-after 2026-01-01
 
-# 4. Semantic search (meaning-based)
+# 5. Semantic search (meaning-based)
 python jama_offline.py semantic --project 12345 --query "headset won't charge"
 
-# 5. SQL query for exact stats
+# 6. SQL query for exact stats
 python jama_offline.py query --project 12345 \
     --sql "SELECT typeKey, COUNT(*) c FROM items GROUP BY typeKey"
+
+# 7. Later, if a query says the cache drifted: incrementally update it
+python jama_offline.py update --project 12345
 ```
 
 ## Commands
@@ -67,16 +76,21 @@ python jama_offline.py query --project 12345 \
 |---------|--------------|
 | `login` | Save credentials once to a user-level file. |
 | `projects` | List matching projects → get the id. |
-| `search` | Hybrid search (FTS + LIKE + vector), RRF-fused. |
-| `semantic` | Pure vector (meaning-based) search. |
-| `query` | Read-only SQL for counts/filters/joins. |
-| `status` | Show what's cached: state, last-sync, size. |
-| `sync` | Build / incrementally update a cache. |
-| `rebuild` | Force a clean full re-download (drops deletions). |
+| `init` | First-time full build (data + vector index + model). Run once per project. |
+| `update` | Incrementally update an existing cache + its vectors (streamed, low-memory, no size limit). |
+| `search` | Hybrid search (FTS + LIKE + vector), RRF-fused. Offline-first (stops if not built / drifted >200). |
+| `semantic` | Pure vector (meaning-based) search. Offline-first. |
+| `query` | Read-only SQL for counts/filters/joins. Offline-first. |
+| `status` | Show what's cached: state, last-sync, size, vector-index state. |
+| `sync` | Build-if-missing else incremental (init + update in one). |
+| `rebuild` | Force a clean full re-download (drops deletions). (alias: `refresh`) |
 | `purge` | Delete cache file(s). |
 
-Add `--offline` to any `search` / `semantic` / `query` to skip the sync and read
-the existing cache as-is (no network or credentials; errors if no cache exists yet).
+`search` / `semantic` / `query` are **offline-first**: they never silently start a long
+build. If the cache / vector index / model is missing, or the project has drifted by more
+than 200 items, they STOP with the exact `init` / `update` command to run; a small delta is
+auto-synced. Add `--offline` to skip the network and read the existing cache as-is (errors
+if a needed file is missing), or `--force` to rebuild on the spot.
 
 ## Files
 
@@ -96,10 +110,12 @@ the existing cache as-is (no network or credentials; errors if no cache exists y
 - Python 3.8+
 - Core (`projects` / `query` / `status`): standard library only.
 - Vector search (`search` / `semantic`): `fastembed` + `sqlite-vec`
-  (auto-installed on first use, China-mirror-first). First run does a one-time
+  (auto-installed on the first build, China-mirror-first). `init` does a one-time
   ~210 MB model download (China-mirror-first, speed-tested) and builds the chunked
-  index (~30–35 min for a 10k-item project on CPU); afterwards only changed items
-  are re-embedded (seconds). Tune the mirror speed cutoff with `JAMA_MIN_KBPS`.
+  index **streamed in low-memory waves** (~30–45 min for a 10k-item project on CPU);
+  afterwards only changed items are re-embedded (seconds). Tune the mirror speed
+  cutoff with `JAMA_MIN_KBPS`, and the query auto-sync limit with `JAMA_DELTA_LIMIT`
+  (default 200).
 
 ## License
 

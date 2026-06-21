@@ -14,16 +14,24 @@ Commands:
     login     --base <url> --client-id <id> --client-secret <s>   save creds to a user-level file (once)
     logout                                                        remove the saved credentials
     projects  --project <regex>                       resolve/list matching projects (the gate)
-    sync      --project <id|name>[,..]                 create-or-incrementally-update up to 5 projects
-              [--no-vectors] [--with-links] [--link-cap N]        (also builds/maintains the vector index)
-              [--prune-deleted]                          also remove server-deleted items (cache+vectors; opt-in)
+    init      --project <id|name>[,..]                 FIRST-TIME full build (data + vector index + model);
+                                                       no-op-with-hint if a cache already exists
+    update    --project <id|name>[,..]                 incrementally update an EXISTING cache + its vectors
+              [--no-vectors] [--prune-deleted]          (streamed, low-memory; no size limit)
     rebuild   --project <id|name>[,..]                 force a clean FULL re-download (drops deletions too)
+    sync      --project <id|name>[,..]                 build-if-missing else incremental (init+update in one)
+              [--no-vectors] [--with-links] [--link-cap N] [--prune-deleted]
     status    [--project <id|name>[,..]]               caches: last-sync, watermark, counts, size, vectors
     search    --project <id> --keyword a,b | --query "..."   HYBRID: FTS + LIKE + vector, RRF-fused/de-duped
               [--type REQ,FEAT] [--top N] [--max-distance D] [--match any|all] [--field name|all] [--json]
     semantic  --project <id> --query "..."             pure vector (KNN) search; [--max-distance D] [--top N]
     query     --project <id> --sql "SELECT ..."        read-only SQL — USE THIS for counts/stats/aggregates
     purge     --project <id|name>[,..] | --all         delete cache file(s) (incl. the vector index)
+
+  search / semantic / query are OFFLINE-FIRST and FAIL-FAST: they never silently trigger a long build. If
+  the cache / vector index / embedding model is missing, or the pending server delta (or vector lag) exceeds
+  DELTA_LIMIT (200) items, they STOP with an exact message telling you to run `init` or `update` first. A
+  small delta IS auto-synced (bounded). `--offline` serves the existing cache as-is; `--force` overrides.
 
 Storage: per-user dir (override with $JAMA_OFFLINE_DIR): jama-proj-<id>.db (main) + jama-proj-<id>.vec.db
     (vectors) + credentials.json + models/. Windows %LOCALAPPDATA%\\jama-offline · macOS ~/Library/
@@ -53,7 +61,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 SKILL_DIR = Path(__file__).resolve().parent
-ENGINE_VERSION = "4.2.0-py"
+ENGINE_VERSION = "4.3.0-py"
 # v4: caches are PERSISTENT (no TTL/expiry). Each use incrementally syncs items whose modifiedDate is
 # >= the cache's watermark (= MAX(modifiedDate)), upserts them, and rebuilds the FTS index. Deletions
 # on the server are NOT tracked (only adds/changes) — use `rebuild` for a clean full re-download.
@@ -66,6 +74,12 @@ ENGINE_VERSION = "4.2.0-py"
 # is untouched; (b) all long downloads/builds emit periodic progress to stderr (pip install, model
 # download, full + incremental cache builds, vector (re)embedding); (c) `search --expr` accepts boolean
 # keyword expressions — AND/OR/NOT + parentheses, e.g. "(dock or cradle) and not legacy". No schema change.
+# v4.3: (a) the vector index is built AND refreshed in bounded-memory STREAMING waves (read item ids, then
+# fetch->chunk->embed->insert one wave at a time), and incremental_sync upserts its delta wave-by-wave too,
+# so peak memory stays small no matter the project size; (b) search/semantic/query are OFFLINE-FIRST &
+# FAIL-FAST: a missing cache / vector index / embedding model, or a pending server delta (or vector lag)
+# over DELTA_LIMIT (200) items, STOPS the query with an actionable message instead of silently kicking off
+# a long download/build; (c) new `init` (first build) and `update` (incremental) commands. No schema change.
 SCHEMA_VERSION = "5"
 MAX_PROJECTS = 5
 PAGE = 50
@@ -745,45 +759,63 @@ def incremental_sync(proj_id, name, concurrency=CONCURRENCY_DEFAULT):
     # every time; that's a cheap idempotent re-upsert and is deliberate — using '>' instead would miss a
     # new item written in the same millisecond as the current high-water mark.
     enc = urllib.parse.quote(watermark, safe="")
-    items = get_pages(f"/rest/v1/abstractitems?project={proj_id}&modifiedDate={enc}", concurrency=concurrency,
-                      progress_label=f"sync {name}")  # shows a bar when the delta spans >1 page
-    timings["fetch_ms"] = int((time.time() - t) * 1000)
-    timings["pulled"] = len(items)
-
+    path = f"/rest/v1/abstractitems?project={proj_id}&modifiedDate={enc}"
     p = db_path(proj_id)
-    now = time.time()
-    if not items:  # nothing changed -> just stamp last_sync_at on the live cache (cheap, safe)
-        try:
-            con = sqlite3.connect(str(p))
-            con.execute("INSERT OR REPLACE INTO meta(key,value) VALUES('last_sync_at',?)", (repr(now),))
-            con.commit()
+    placeholders = ",".join("?" * len(ITEM_COLUMNS))
+    item_cols = ",".join(ITEM_COLUMNS)
+    # STREAM the delta wave-by-wave (see iter_pages) so a large `update` never buffers the whole changed set
+    # in memory; the cache is cloned lazily only once we see the first changed item, and each wave is upserted
+    # + committed + released. FTS is rebuilt once at the end. Mirrors build_db's bounded-memory pattern.
+    tmp = con = None
+    pick_cache, pulled, new_wm = {}, 0, watermark
+    try:
+        for wave in iter_pages(path, concurrency=concurrency, progress_label=f"sync {name}"):
+            if not wave:
+                continue
+            if con is None:  # per-process temp -> concurrent syncs of the same project don't collide
+                tmp = _unique_tmp(p, "db")
+                tmp.unlink(missing_ok=True)
+                shutil.copy2(p, tmp)  # keeps the swap atomic and the original pristine on failure
+                con = sqlite3.connect(str(tmp))
+            item_rows, kv_rows, pick_rows = _rows_from_items(wave, concurrency, pick_cache)
+            ids = [r[0] for r in item_rows]
+            qmarks = ",".join("?" * len(ids))
+            con.executemany(f"INSERT OR REPLACE INTO items({item_cols}) VALUES ({placeholders})", item_rows)
+            con.execute(f"DELETE FROM fields_kv WHERE itemId IN ({qmarks})", ids)  # no PK -> clear, re-insert
+            con.executemany("INSERT INTO fields_kv(itemId,key,value) VALUES (?,?,?)", kv_rows)
+            if pick_rows:
+                con.executemany("INSERT OR IGNORE INTO picklist(id,name,pickList) VALUES (?,?,?)", pick_rows)
+            bw = max((r[_MODIFIED_IDX] for r in item_rows if r[_MODIFIED_IDX]), default="")
+            if bw > new_wm:
+                new_wm = bw
+            pulled += len(item_rows)
+            con.commit()  # flush this wave so neither SQLite's page cache nor our row lists accumulate
+            item_rows = kv_rows = pick_rows = ids = None
+    except BaseException:
+        if con is not None:
             con.close()
+        if tmp is not None:
+            tmp.unlink(missing_ok=True)
+        raise
+    timings["fetch_ms"] = int((time.time() - t) * 1000)
+    timings["pulled"] = pulled
+
+    now = time.time()
+    if con is None:  # nothing changed -> just stamp last_sync_at on the live cache (cheap, safe)
+        try:
+            live = sqlite3.connect(str(p))
+            live.execute("INSERT OR REPLACE INTO meta(key,value) VALUES('last_sync_at',?)", (repr(now),))
+            live.commit()
+            live.close()
         except sqlite3.Error:
             pass
         timings["upserted"] = 0
         return {"proj_id": proj_id, "name": name, "upserted": 0, "watermark": watermark,
                 "size_mb": round(p.stat().st_size / 1048576, 2), **timings}
 
-    item_rows, kv_rows, pick_rows = _rows_from_items(items, concurrency)
-    ids = [r[0] for r in item_rows]
-
     t = time.time()
-    tmp = _unique_tmp(p, "db")  # per-process temp -> concurrent syncs of the same project don't collide
-    tmp.unlink(missing_ok=True)
-    shutil.copy2(p, tmp)  # ~17ms for 30MB; keeps the swap atomic and the original pristine on failure
-    con = sqlite3.connect(str(tmp))
     try:
-        placeholders = ",".join("?" * len(ITEM_COLUMNS))
-        qmarks = ",".join("?" * len(ids))
-        con.executemany(f"INSERT OR REPLACE INTO items({','.join(ITEM_COLUMNS)}) VALUES ({placeholders})",
-                        item_rows)
-        # fields_kv has no PK -> clear each changed item's rows, then re-insert
-        con.execute(f"DELETE FROM fields_kv WHERE itemId IN ({qmarks})", ids)
-        con.executemany("INSERT INTO fields_kv(itemId,key,value) VALUES (?,?,?)", kv_rows)
-        if pick_rows:
-            con.executemany("INSERT OR IGNORE INTO picklist(id,name,pickList) VALUES (?,?,?)", pick_rows)
         con.execute("INSERT INTO fts(fts) VALUES('rebuild')")  # full FTS rebuild from items (~58ms @10k)
-        new_wm = max((r[_MODIFIED_IDX] for r in item_rows if r[_MODIFIED_IDX]), default=watermark)
         new_wm = max(new_wm, watermark)
         counts = dict(con.execute("SELECT 'i',COUNT(*) FROM items UNION ALL SELECT 'k',COUNT(*) FROM fields_kv").fetchall())
         upd = {"fetched_at": repr(now), "last_sync_at": repr(now), "watermark": new_wm,
@@ -798,10 +830,10 @@ def incremental_sync(proj_id, name, concurrency=CONCURRENCY_DEFAULT):
     con.close()
     _atomic_swap(tmp, p)
     timings["write_ms"] = int((time.time() - t) * 1000)
-    timings["upserted"] = len(item_rows)
+    timings["upserted"] = pulled
     # NOTE: vectors are refreshed separately by refresh_vectors(), which sources the changed set from the
     # main cache by vec_watermark — so this return intentionally carries no item list for the vector path.
-    return {"proj_id": proj_id, "name": name, "upserted": len(item_rows), "watermark": new_wm,
+    return {"proj_id": proj_id, "name": name, "upserted": pulled, "watermark": new_wm,
             "size_mb": round(p.stat().st_size / 1048576, 2), **timings}
 
 
@@ -1097,6 +1129,11 @@ EMBED_DIM = 768
 # bge-base attention is O(batch * 512^2); batch 64 can spike ~300MB/buffer and OOM. 16 is the safe,
 # still-fast default (compute-bound at 80% threads, not batch-overhead-bound).
 VEC_BATCH = 16
+# Streaming (re)build wave size: items pulled + chunked + embedded + inserted per wave (see build_vectors /
+# refresh_vectors). Bounds peak memory to ~one wave of chunks+vectors regardless of project size; small
+# enough that progress ticks often, large enough to keep fastembed batches efficient, and well under
+# SQLite's IN(...) parameter limit for the per-wave id fetch.
+VEC_ITEM_WAVE = 200
 VEC_SCHEMA = "2"  # v2: chunked index — vec is keyed by chunk_id, chunk_map folds chunk->item
 # Chunking (instead of truncating) so a long test case's full name+description+steps is embedded and
 # searchable end to end. 1500-char windows with 200-char overlap keep each chunk under bge's 512-token
@@ -1286,12 +1323,13 @@ def item_chunks(name, description, steps):
     return _chunk_text(_item_text(name, description, steps)[:MAX_EMBED_CHARS])
 
 
-def _chunk_units(rows):
+def _chunk_units(rows, start=0):
     """Expand item rows into per-chunk embedding units. Returns three parallel lists
-    (chunk_ids, item_ids, texts); chunk_id is a fresh 1-based sequence (the vec table's PK) and item_id
-    its owning item. Every item yields >= 1 chunk, so no item is dropped from the index."""
+    (chunk_ids, item_ids, texts); chunk_id is a CONTIGUOUS sequence beginning at start+1 (pass the running
+    high-water mark so successive STREAMING waves never collide on the vec PK) and item_id its owning item.
+    Every item yields >= 1 chunk, so no item is dropped from the index."""
     chunk_ids, item_ids, texts = [], [], []
-    cid = 0
+    cid = start
     for r in rows:
         chunks = item_chunks(r["name"], r["description"], r["stepsText"]) or [(r["name"] or "")]
         for c in chunks:
@@ -1300,6 +1338,14 @@ def _chunk_units(rows):
             item_ids.append(r["id"])
             texts.append(c)
     return chunk_ids, item_ids, texts
+
+
+def _lensort(chunk_ids, item_ids, texts):
+    """Reorder a wave's parallel (chunk_ids, item_ids, texts) by ascending text length so each fixed-size
+    fastembed batch is length-homogeneous (it pads to the longest member, so mixing a 512-token monster with
+    short docs wastes ~3x compute). The chunk<->item<->text alignment is preserved."""
+    order = sorted(range(len(texts)), key=lambda i: len(texts[i]))
+    return ([chunk_ids[i] for i in order], [item_ids[i] for i in order], [texts[i] for i in order])
 
 
 def _vec_connect(path, create=False):
@@ -1341,6 +1387,41 @@ def _progress(label, total):
     return cb
 
 
+class _CountProgress(threading.Thread):
+    """Time-based stderr progress for a long streaming count job (the wave-by-wave embed). The worker bumps
+    `.done`; THIS thread is the sole writer, re-rendering 'label [bar] pct done/total rate ETA elapsed' every
+    `interval`s — so feedback keeps ticking even while a single wave is mid-flight, and stdout stays clean for
+    results. Single writer => no interleave with the worker."""
+
+    def __init__(self, label, total, interval=3.0):
+        super().__init__(daemon=True)
+        self.label, self.total, self.interval = label, max(0, int(total)), interval
+        self.done = 0
+        self._stop = threading.Event()
+        self._t0 = time.time()
+
+    def _render(self):
+        total = self.total or 1
+        pct = min(100, int(self.done * 100 / total))
+        el = time.time() - self._t0
+        rate = self.done / el if el > 0 else 0
+        eta = (self.total - self.done) / rate if (rate > 0 and self.total) else 0
+        bar = "#" * (pct // 5) + "-" * (20 - pct // 5)
+        sys.stderr.write(f"\r  {self.label} [{bar}] {pct:3d}%  {self.done}/{self.total}  "
+                         f"{rate:.0f}/s  ETA {eta:4.0f}s  el {el:4.0f}s ")
+        sys.stderr.flush()
+
+    def run(self):
+        while not self._stop.wait(self.interval):
+            self._render()
+
+    def stop(self):
+        self._stop.set()
+        self._render()
+        sys.stderr.write("\n")
+        sys.stderr.flush()
+
+
 def embed_corpus(texts, label="embedding", quiet=False):
     """Embed texts with a progress bar; returns list of float32 vectors (order preserved)."""
     emb = get_embedder()
@@ -1373,43 +1454,56 @@ def vec_index_state(proj_id):
 
 
 def build_vectors(proj_id, quiet=False):
-    """Full (re)build of the project's CHUNKED vector index from the main cache. Each item's full text
-    (name + description + steps) is split into overlapping chunks; every chunk is embedded and mapped
-    back to its item via chunk_map. Atomic swap; progress bar."""
+    """Full (re)build of the project's CHUNKED vector index from the main cache, STREAMED wave-by-wave so
+    peak memory stays bounded (~one VEC_ITEM_WAVE of chunks + their 768-d vectors) no matter how large the
+    project is — instead of materializing every chunk and every vector at once. Per wave: fetch that wave's
+    item rows from the main cache (a brief read lock only — never held across the long embed), chunk them,
+    length-sort, embed, INSERT + COMMIT into a per-process temp vec DB, then release. The model is loaded/
+    downloaded up-front (its own progress bar); a time-based heartbeat then reports embedding progress on
+    stderr. Atomic swap at the end; a crash/Ctrl-C just discards the temp and leaves any previous index
+    intact."""
     ensure_vectors()  # required: auto-installs fastembed/sqlite-vec if missing
     main = open_db(proj_id)
-    try:
-        rows = main.execute("SELECT id, name, description, stepsText FROM items ORDER BY id").fetchall()
+    try:  # read just the id list + watermark up-front (tiny) so we never hold a read lock during the embed
+        ids = [r[0] for r in main.execute("SELECT id FROM items ORDER BY id")]
         wmrow = main.execute("SELECT value FROM meta WHERE key='watermark'").fetchone()
     finally:
         main.close()
-    chunk_ids, item_ids, texts = _chunk_units(rows)
-    n_items = len(set(item_ids))
-    # Sort chunks by text length so each fixed-size batch is length-homogeneous: fastembed pads every
-    # batch to its longest member, so mixing a 512-token monster with short docs wastes ~3x compute.
-    # We keep chunk_ids + item_ids aligned with their text through the sort.
-    order = sorted(range(len(texts)), key=lambda i: len(texts[i]))
-    chunk_ids = [chunk_ids[i] for i in order]
-    item_ids = [item_ids[i] for i in order]
-    texts = [texts[i] for i in order]
-    # Always announce + show the embedding bar (even on the otherwise-quiet search/semantic path): this is
-    # the multi-minute step the user must be able to watch, so progress is NOT gated by `quiet`.
-    print(f"[vectors] embedding {len(texts)} chunks from {n_items} items — {EMBED_MODEL}, "
+    n_items = len(ids)
+    wm = (wmrow[0] if wmrow else "") or ""
+    get_embedder()  # trigger model load/download now (own bar) BEFORE the embed heartbeat -> no interleave
+    print(f"[vectors] embedding {n_items} items in streaming waves of {VEC_ITEM_WAVE} — {EMBED_MODEL}, "
           f"{embed_threads()} threads (one-time, ~35-45 min for 10k items on CPU; later syncs only "
           f"re-embed changed items)", file=sys.stderr)
-    t = time.time()
-    vecs = embed_corpus(texts, label="embed", quiet=False)
     p = vec_db_path(proj_id)
     tmp = _unique_tmp(p, "vec.db")
     tmp.unlink(missing_ok=True)
     con = _vec_connect(tmp, create=True)
+    cid, n_chunks, t = 0, 0, time.time()
+    hb = _CountProgress("embed", n_items)
+    hb.start()
     try:
-        con.executemany("INSERT INTO vec(chunk_id, embedding) VALUES (?, ?)",
-                        [(c, v.tobytes()) for c, v in zip(chunk_ids, vecs)])
-        con.executemany("INSERT INTO chunk_map(chunk_id, item_id) VALUES (?, ?)",
-                        list(zip(chunk_ids, item_ids)))
-        wm = (wmrow[0] if wmrow else "")
-        meta = {"embed_model": EMBED_MODEL, "dim": str(EMBED_DIM), "vec_count": str(len(chunk_ids)),
+        for wave_ids in _batches(ids, VEC_ITEM_WAVE):
+            main = open_db(proj_id)
+            try:
+                q = ",".join("?" * len(wave_ids))
+                rows = main.execute(f"SELECT id, name, description, stepsText FROM items WHERE id IN ({q})",
+                                    wave_ids).fetchall()
+            finally:
+                main.close()
+            chunk_ids, item_ids, texts = _chunk_units(rows, start=cid)  # contiguous ids above the last wave
+            cid += len(chunk_ids)
+            chunk_ids, item_ids, texts = _lensort(chunk_ids, item_ids, texts)
+            vecs = embed_corpus(texts, quiet=True)  # the heartbeat shows progress; no inner per-call bar
+            con.executemany("INSERT INTO vec(chunk_id, embedding) VALUES (?, ?)",
+                            ((c, v.tobytes()) for c, v in zip(chunk_ids, vecs)))
+            con.executemany("INSERT INTO chunk_map(chunk_id, item_id) VALUES (?, ?)",
+                            zip(chunk_ids, item_ids))
+            con.commit()  # flush this wave so neither SQLite's page cache nor our row/vector lists accumulate
+            n_chunks += len(chunk_ids)
+            hb.done += len(rows)
+            rows = chunk_ids = item_ids = texts = vecs = None  # release before fetching the next wave
+        meta = {"embed_model": EMBED_MODEL, "dim": str(EMBED_DIM), "vec_count": str(n_chunks),
                 "item_count": str(n_items), "main_watermark": wm, "vec_watermark": wm,
                 "built_at": repr(time.time()), "vec_schema": VEC_SCHEMA, "engine_version": ENGINE_VERSION}
         con.executemany("INSERT OR REPLACE INTO vmeta(key,value) VALUES (?,?)", list(meta.items()))
@@ -1417,21 +1511,25 @@ def build_vectors(proj_id, quiet=False):
     except BaseException:
         con.close()
         tmp.unlink(missing_ok=True)
+        hb.stop()
         raise
     con.close()
+    hb.stop()
     _atomic_swap(tmp, p)
     if not quiet:
-        print(f"[vectors] built {len(chunk_ids)} chunk vectors ({n_items} items) in {time.time()-t:.0f}s "
+        print(f"[vectors] built {n_chunks} chunk vectors ({n_items} items) in {time.time()-t:.0f}s "
               f"-> {p.name} ({p.stat().st_size/1048576:.1f} MB)")
-    return {"vec_count": len(chunk_ids), "item_count": n_items, "build_s": round(time.time() - t, 1)}
+    return {"vec_count": n_chunks, "item_count": n_items, "build_s": round(time.time() - t, 1)}
 
 
 def refresh_vectors(proj_id, quiet=True):
-    """Bring the EXISTING vec index up to date with the main cache (copy+swap). Re-embeds every item whose
-    modifiedDate is >= the index's vec_watermark, reading the text LOCALLY from the main cache (no network).
-    Sourcing the set from the main cache (not just the items the last incremental pulled) is what stops the
-    vector index drifting stale when a vectors-less command — e.g. `query` — synced changed items into the
-    main cache. No-op if the index is absent/stale (caller does a full build) or nothing changed."""
+    """Bring the EXISTING vec index up to date with the main cache (copy+swap), STREAMED so memory stays
+    bounded even when many items changed (e.g. a big `update`). Re-embeds every item whose modifiedDate is
+    >= the index's vec_watermark, reading the text LOCALLY from the main cache (no network). Sourcing the set
+    from the main cache (not just what the last incremental pulled) is what stops the vector index drifting
+    stale when a vectors-less command — e.g. `query` — synced changed items into the main cache. The changed
+    items' OLD chunks are dropped up-front (cheap), then their fresh chunks are embedded + inserted wave-by-
+    wave. No-op if the index is absent/stale (caller does a full build) or nothing changed."""
     state, vmeta = vec_index_state(proj_id)
     if state != "ready":
         return None  # absent/stale -> the caller's build_vectors() (re)builds the whole index instead
@@ -1439,41 +1537,55 @@ def refresh_vectors(proj_id, quiet=True):
     if not wm:
         return None  # indeterminate watermark -> leave it to a full rebuild rather than re-embed everything
     main = open_db(proj_id)
-    try:  # inclusive >= mirrors incremental_sync: catches an item written in the watermark's exact ms
-        rows = main.execute("SELECT id, name, description, stepsText FROM items WHERE modifiedDate >= ?",
-                            (wm,)).fetchall()
+    try:  # inclusive >= mirrors incremental_sync: catches an item written in the watermark's exact ms. Read
+        ids = [r[0] for r in  # only the changed ids up-front (tiny) -> no read lock held during the embed
+               main.execute("SELECT id FROM items WHERE modifiedDate >= ? ORDER BY id", (wm,))]
         wmrow = main.execute("SELECT value FROM meta WHERE key='watermark'").fetchone()
     finally:
         main.close()
-    if not rows:
+    if not ids:
         return None
     new_wm = (wmrow[0] if wmrow else wm) or wm
     ensure_vectors()
-    ids = sorted({r["id"] for r in rows})
-    cids, iids, texts = _chunk_units(rows)
-    # Show the re-embed bar regardless of `quiet` so an incremental sync (full OR via search/semantic) gives
-    # periodic feedback on the changed items being re-embedded; it's a short, signal-only stderr line.
-    vecs = embed_corpus(texts, label=f"re-embed {len(ids)} item(s)", quiet=False)
+    get_embedder()  # model up-front (own bar) before the embed heartbeat -> no interleave
     p = vec_db_path(proj_id)
     tmp = _unique_tmp(p, "vec.db")
     tmp.unlink(missing_ok=True)
     shutil.copy2(p, tmp)
     con = _vec_connect(tmp)
+    hb = _CountProgress(f"re-embed {len(ids)} item(s)", len(ids))
+    hb.start()
     try:
-        qmarks = ",".join("?" * len(ids))
-        # drop every existing chunk of the refreshed items (an item's chunk count may change), then re-add
-        old_chunks = [r[0] for r in
-                      con.execute(f"SELECT chunk_id FROM chunk_map WHERE item_id IN ({qmarks})", ids).fetchall()]
-        if old_chunks:
-            cm = ",".join("?" * len(old_chunks))
-            con.execute(f"DELETE FROM vec WHERE chunk_id IN ({cm})", old_chunks)
-            con.execute(f"DELETE FROM chunk_map WHERE chunk_id IN ({cm})", old_chunks)
-        # fresh chunk_ids above the current max so they never collide with surviving rows
-        mx = con.execute("SELECT COALESCE(MAX(chunk_id), 0) FROM chunk_map").fetchone()[0]
-        cids = [c + mx for c in cids]
-        con.executemany("INSERT INTO vec(chunk_id, embedding) VALUES (?, ?)",
-                        [(c, v.tobytes()) for c, v in zip(cids, vecs)])
-        con.executemany("INSERT INTO chunk_map(chunk_id, item_id) VALUES (?, ?)", list(zip(cids, iids)))
+        # drop every existing chunk of the changed items first (an item's chunk count may change), then
+        # re-add fresh chunks with ids above the surviving max so they never collide with what remains.
+        for batch in _batches(ids):
+            qb = ",".join("?" * len(batch))
+            old = [r[0] for r in
+                   con.execute(f"SELECT chunk_id FROM chunk_map WHERE item_id IN ({qb})", batch).fetchall()]
+            for ob in _batches(old):
+                cm = ",".join("?" * len(ob))
+                con.execute(f"DELETE FROM vec WHERE chunk_id IN ({cm})", ob)
+                con.execute(f"DELETE FROM chunk_map WHERE chunk_id IN ({cm})", ob)
+        cid = con.execute("SELECT COALESCE(MAX(chunk_id), 0) FROM chunk_map").fetchone()[0]
+        con.commit()
+        for wave_ids in _batches(ids, VEC_ITEM_WAVE):  # embed the changed items wave-by-wave (bounded memory)
+            main = open_db(proj_id)
+            try:
+                q = ",".join("?" * len(wave_ids))
+                rows = main.execute(f"SELECT id, name, description, stepsText FROM items WHERE id IN ({q})",
+                                    wave_ids).fetchall()
+            finally:
+                main.close()
+            cids, iids, texts = _chunk_units(rows, start=cid)  # contiguous ids above the surviving max
+            cid += len(cids)
+            cids, iids, texts = _lensort(cids, iids, texts)
+            vecs = embed_corpus(texts, quiet=True)  # heartbeat shows progress; no inner per-call bar
+            con.executemany("INSERT INTO vec(chunk_id, embedding) VALUES (?, ?)",
+                            ((c, v.tobytes()) for c, v in zip(cids, vecs)))
+            con.executemany("INSERT INTO chunk_map(chunk_id, item_id) VALUES (?, ?)", zip(cids, iids))
+            con.commit()
+            hb.done += len(rows)
+            rows = cids = iids = texts = vecs = None  # release before the next wave
         vc = con.execute("SELECT COUNT(*) FROM vec").fetchone()[0]
         ic = con.execute("SELECT COUNT(DISTINCT item_id) FROM chunk_map").fetchone()[0]
         con.executemany("INSERT OR REPLACE INTO vmeta(key,value) VALUES (?,?)",
@@ -1483,8 +1595,10 @@ def refresh_vectors(proj_id, quiet=True):
     except BaseException:
         con.close()
         tmp.unlink(missing_ok=True)
+        hb.stop()
         raise
     con.close()
+    hb.stop()
     # Retry the swap on a transient file-lock conflict from parallel access; on exhaustion, skip the
     # refresh (use the existing index — offline-style fallback) rather than crash the query.
     for _attempt in range(VEC_SWAP_RETRIES):
@@ -1855,6 +1969,130 @@ def ensure_synced(proj_id, name, force=False, offline=False, with_links=False, l
     return res
 
 
+# ============================ query preflight: offline-first, fail-fast gate ============================
+# search / semantic / query NEVER silently kick off a long download/build. Before serving, preflight_query
+# verifies the prerequisites EXIST and that any pending change is SMALL; otherwise it STOPS with an exact,
+# actionable message (run `init` or `update`). A small delta (<= DELTA_LIMIT) is auto-synced (bounded,
+# streamed). This is the behavioural heart of v4.3: a query on a not-yet-built / badly-stale project tells
+# the user what to do instead of blocking for ~50 min on a full build.
+def delta_limit():
+    """Max changed/lagging items a query will auto-sync before it STOPS and asks the user to `update`
+    explicitly. Default 200; override with $JAMA_DELTA_LIMIT (handy for tests, or a faster/slower link)."""
+    try:
+        return max(0, int(os.environ.get("JAMA_DELTA_LIMIT", "200")))
+    except ValueError:
+        return 200
+
+
+def _modified_since_count(proj_id, watermark):
+    """Cheap server-side count of items modified at/after `watermark` (one request, maxResults=1) — the size
+    of the pending incremental delta (new + changed). None if the watermark is unusable. The boundary item(s)
+    at exactly the watermark are included, so a fully-synced cache returns a small non-zero number."""
+    if not watermark:
+        return None
+    enc = urllib.parse.quote(watermark, safe="")
+    d = api_get(f"/rest/v1/abstractitems?project={proj_id}&modifiedDate={enc}&startAt=0&maxResults=1")
+    return int(d["meta"]["pageInfo"]["totalResults"])
+
+
+def _vec_stale_count(proj_id):
+    """How many cached items are not yet reflected in the vector index (modifiedDate >= vec_watermark) —
+    pure-local SQL, no network. Returns the count, or None if there is no ready index to compare against."""
+    state, vmeta = vec_index_state(proj_id)
+    if state != "ready":
+        return None
+    vwm = vmeta.get("vec_watermark") or vmeta.get("main_watermark") or ""
+    con = open_db(proj_id)
+    try:
+        if vwm:
+            return con.execute("SELECT COUNT(*) FROM items WHERE modifiedDate >= ?", (vwm,)).fetchone()[0]
+        return con.execute("SELECT COUNT(*) FROM items").fetchone()[0]
+    finally:
+        con.close()
+
+
+def _stop_need_init(proj_id, name, need_vectors, reason):
+    extra = " + a vector index" if need_vectors else ""
+    sys.exit(f"[{proj_id} {name}] {reason}. Initialize it first (one-time full download{extra}):\n"
+             f"    jama_offline.py init --project {proj_id}\n"
+             f"（没有缓存文件，请先运行 init 初始化下载，再查询。）")
+
+
+def preflight_query(proj_id, name, need_vectors, *, offline=False, force=False,
+                    concurrency=CONCURRENCY_DEFAULT, quiet=True):
+    """Gate a search/semantic/query per the OFFLINE-FIRST policy and, on success, do the bounded sync the
+    query needs. NEVER silently triggers a long build. Order of checks:
+      1. main cache present + readable               (else STOP -> init / rebuild)
+      2. need_vectors: vector index + model present  (else STOP -> update)
+      3. --offline: serve the existing cache as-is (no network)  |  --force: rebuild then serve
+      4. server delta (modified since watermark) <= DELTA_LIMIT   (else STOP -> update)
+      5. need_vectors: local vector lag <= DELTA_LIMIT            (else STOP -> update)
+      6. PASS -> bounded incremental_sync (+ refresh_vectors) right here, then return.
+    Every STOP is a sys.exit with an exact, bilingual, copy-pasteable next command."""
+    info = cache_state(proj_id)
+
+    # 1) main cache must exist and be readable
+    if info["state"] == "missing":
+        _stop_need_init(proj_id, name, need_vectors, "no offline cache yet")
+    if info["state"] == "corrupt":
+        sys.exit(f"[{proj_id} {name}] the cache is unreadable or built by an older schema. Rebuild it:\n"
+                 f"    jama_offline.py rebuild --project {proj_id}\n"
+                 f"（缓存文件损坏或版本过旧，请先 rebuild 重建，再查询。）")
+
+    # 2) vector index + embedding model must exist for vector queries (search/semantic)
+    if need_vectors:
+        vstate, _ = vec_index_state(proj_id)
+        if vstate == "absent":
+            sys.exit(f"[{proj_id} {name}] no vector index ({vec_db_path(proj_id).name}) yet — build it once:\n"
+                     f"    jama_offline.py update --project {proj_id}\n"
+                     f"（没有向量缓存文件，请先 update 建立向量索引，再查询。）")
+        if vstate == "stale":
+            sys.exit(f"[{proj_id} {name}] the vector index was built with a different embedding model — "
+                     f"rebuild it:\n    jama_offline.py update --project {proj_id}\n"
+                     f"（向量索引与当前模型不一致，请先 update 重建向量，再查询。）")
+        if not _model_cached():
+            sys.exit(f"[{proj_id} {name}] the embedding model is not downloaded yet (~210MB) — fetch it once:\n"
+                     f"    jama_offline.py update --project {proj_id}\n"
+                     f"（没有模型文件，请先 update 下载嵌入模型，再查询。）")
+
+    # 3) escape hatches: --offline serves as-is (no network); --force rebuilds (explicit user opt-in)
+    if offline:
+        if not quiet:
+            print(f"[{proj_id} {name}] --offline -> using the existing cache as-is (no sync)")
+        return
+    if force:
+        ensure_synced(proj_id, name, force=True, concurrency=concurrency,
+                      want_vectors=need_vectors, quiet=quiet)
+        return
+
+    # 4) main-cache difference vs the server (one cheap count). Too big -> ask the user to `update`.
+    lim = delta_limit()
+    server_delta = _modified_since_count(proj_id, info["meta"].get("watermark") or "")
+    if server_delta is None or server_delta > lim:
+        howmany = "an unknown number of" if server_delta is None else str(server_delta)
+        sys.exit(f"[{proj_id} {name}] {howmany} item(s) changed on the server since the last cache update "
+                 f"(over the {lim}-item auto-sync limit). Update the cache first, then re-run your query:\n"
+                 f"    jama_offline.py update --project {proj_id}\n"
+                 f"（服务器自上次缓存以来变化超过 {lim} 条，请先 update 更新缓存，再查询。）")
+
+    # 5) vector-index difference vs the main cache (vector queries only). Too big -> ask the user to `update`.
+    if need_vectors:
+        vstale = _vec_stale_count(proj_id)
+        if vstale is not None and vstale > lim:
+            sys.exit(f"[{proj_id} {name}] {vstale} cached item(s) are not yet in the vector index "
+                     f"(over the {lim}-item limit). Update it first, then re-run your query:\n"
+                     f"    jama_offline.py update --project {proj_id}\n"
+                     f"（向量索引落后缓存超过 {lim} 条，请先 update 更新向量，再查询。）")
+
+    # 6) passed -> bounded incremental sync (+ vector refresh) for the small delta, then serve
+    res = incremental_sync(proj_id, name, concurrency)
+    if res is None:  # watermark slipped away between cache_state and here -> point the user at rebuild
+        sys.exit(f"[{proj_id} {name}] the cache has no usable watermark. Rebuild it:\n"
+                 f"    jama_offline.py rebuild --project {proj_id}")
+    if need_vectors and vec_index_state(proj_id)[0] == "ready":
+        refresh_vectors(proj_id, quiet=quiet)
+
+
 # ============================ SQL helpers ============================
 def open_db(proj_id):
     # Read-only: search/query never mutate the cache, and mode=ro makes a stray write in user SQL fail
@@ -1953,15 +2191,32 @@ def cmd_projects(a):
         print(f"{p['id']:<8} {p.get('projectKey', ''):<12} {p['fields']['name']}")
 
 
-def cmd_sync(a, force=False):
+def cmd_sync(a, force=False, gate=None):
+    """Build / update a cache (+ its vector index). `gate` shapes the per-project policy:
+      None     -> sync : build if missing, else incremental update (init + update in one).
+      'init'   -> only build if MISSING/corrupt; if a cache already exists, skip with a hint (don't silently
+                  rebuild — a full rebuild is the ~50-min path and must be asked for via `rebuild`).
+      'update' -> only act if a cache EXISTS; if there is none yet, tell the user to `init` first.
+    `force` (rebuild/refresh) ignores `gate` and does a clean full re-download. Vectors are built/maintained
+    by default (--no-vectors to skip); --prune-deleted also removes server-side deletions."""
     projs = resolve_projects(a.project)
     force = force or a.force
-    mode = "REBUILD (full re-download)" if force else "sync (incremental)"
+    mode = ("REBUILD (full re-download)" if force else
+            {"init": "INIT (first-time full build)", "update": "UPDATE (incremental)"}.get(gate, "sync"))
     print(f"[{mode}] resolved {len(projs)} project(s): " +
           ", ".join(f"{p['id']}={p['name']}" for p in projs))
-    want_vectors = not a.no_vectors  # sync/rebuild build+maintain the vector index by default
+    want_vectors = not a.no_vectors  # init/update/sync/rebuild build+maintain the vector index by default
     summary = []
     for pr in projs:
+        if not force and gate in ("init", "update"):
+            st = cache_state(pr["id"])["state"]
+            if gate == "init" and st == "present":
+                print(f"[{pr['id']} {pr['name']}] already initialized (cache present) — use `update` to refresh "
+                      f"or `rebuild` to re-download from scratch. Skipping.")
+                continue
+            if gate == "update" and st == "missing":
+                print(f"[{pr['id']} {pr['name']}] no cache yet — run `init --project {pr['id']}` first. Skipping.")
+                continue
         t = time.time()
         s = ensure_synced(pr["id"], pr["name"], force=force,
                           with_links=a.with_links, link_cap=a.link_cap, concurrency=a.concurrency,
@@ -2038,8 +2293,10 @@ def cmd_search(a):
     md = a.max_distance if a.max_distance is not None else VEC_MAX_DISTANCE
     dates = norm_dates(a)  # optional created/modified range filter (applied to every leg)
     pr = single_project(a.project)
-    ensure_synced(pr["id"], pr["name"], force=a.force, offline=a.offline, quiet=True,
-                  concurrency=a.concurrency, want_vectors=True)
+    # offline-first gate: STOP (with guidance) if the cache / vector index / model is missing or the pending
+    # delta is over the limit; otherwise do the small bounded sync + vector refresh, then serve.
+    preflight_query(pr["id"], pr["name"], need_vectors=True, offline=a.offline, force=a.force,
+                    concurrency=a.concurrency)
     t = time.time()
     rows = hybrid_search(pr["id"], query_text, ast, field=a.field,
                          top=a.top, type_arg=a.type, max_distance=md, dates=dates)
@@ -2054,7 +2311,10 @@ def cmd_query(a):
     if not re.match(r"(?is)^\s*(SELECT|WITH)\b", a.sql):
         sys.exit("Only read-only SELECT/WITH queries are allowed.")
     pr = single_project(a.project)
-    ensure_synced(pr["id"], pr["name"], force=a.force, offline=a.offline, quiet=True, concurrency=a.concurrency)
+    # offline-first gate: needs the cache present and the server delta small (no vectors for SQL); else STOPs
+    # with guidance to run init/update. A small delta is auto-synced before the query runs.
+    preflight_query(pr["id"], pr["name"], need_vectors=False, offline=a.offline, force=a.force,
+                    concurrency=a.concurrency)
     con = open_db(pr["id"])
     try:
         t = time.time()
@@ -2072,9 +2332,10 @@ def cmd_semantic(a):
     md = a.max_distance if a.max_distance is not None else VEC_MAX_DISTANCE
     dates = norm_dates(a)  # optional created/modified range filter
     pr = single_project(a.project)
-    # ensure main cache fresh AND the vector index exists/updated (want_vectors=True)
-    ensure_synced(pr["id"], pr["name"], force=a.force, offline=a.offline, quiet=True,
-                  concurrency=a.concurrency, want_vectors=True)
+    # offline-first gate: needs the cache, vector index AND embedding model present; STOPs with guidance if
+    # anything is missing or the pending delta is over the limit, else does the small bounded sync + refresh.
+    preflight_query(pr["id"], pr["name"], need_vectors=True, offline=a.offline, force=a.force,
+                    concurrency=a.concurrency)
     t = time.time()
     rows = semantic_search(pr["id"], q, top=a.top, type_arg=a.type, max_distance=md, dates=dates)
     ms = int((time.time() - t) * 1000)
@@ -2136,10 +2397,11 @@ COMMANDS = {
     "login": cmd_login,
     "logout": cmd_logout,
     "projects": cmd_projects,
-    "sync": cmd_sync,
-    "rebuild": lambda a: cmd_sync(a, force=True),
-    "refresh": lambda a: cmd_sync(a, force=True),
-    "update": lambda a: cmd_sync(a, force=True),
+    "init": lambda a: cmd_sync(a, gate="init"),       # first-time full build (data + vectors + model)
+    "update": lambda a: cmd_sync(a, gate="update"),   # incremental update of an existing cache + vectors
+    "sync": cmd_sync,                                  # build-if-missing else incremental (init+update in one)
+    "rebuild": lambda a: cmd_sync(a, force=True),      # force a clean FULL re-download (drops deletions)
+    "refresh": lambda a: cmd_sync(a, force=True),      # alias of rebuild
     "status": cmd_status,
     "search": cmd_search,
     "semantic": cmd_semantic,
@@ -2161,10 +2423,10 @@ def build_parser():
         sp.add_argument("--offline", action="store_true",
                         help="search/semantic/query: use the existing cache as-is, skip the online sync")
         sp.add_argument("--no-vectors", action="store_true", dest="no_vectors",
-                        help="sync/rebuild: skip building/updating the semantic vector index")
+                        help="init/update/sync/rebuild: skip building/updating the semantic vector index")
         sp.add_argument("--prune-deleted", action="store_true", dest="prune_deleted",
-                        help="sync: also detect & remove items deleted on the server (cache + vectors); "
-                             "OFF by default, cheap unless deletions exist")
+                        help="init/update/sync/rebuild: also detect & remove items deleted on the server "
+                             "(cache + vectors); OFF by default, cheap unless deletions exist")
         sp.add_argument("--with-links", action="store_true", dest="with_links")
         sp.add_argument("--link-cap", type=int, default=0, dest="link_cap")
         sp.add_argument("--all", action="store_true")
