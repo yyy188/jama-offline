@@ -73,7 +73,7 @@ ENGINE_VERSION = "4.3.0-py"
 # live speed test (China-first, international fallback, abort if neither is fast enough) — Jama API traffic
 # is untouched; (b) all long downloads/builds emit periodic progress to stderr (pip install, model
 # download, full + incremental cache builds, vector (re)embedding); (c) `search --expr` accepts boolean
-# keyword expressions — AND/OR/NOT + parentheses, e.g. "(dock or cradle) and not legacy". No schema change.
+# keyword expressions — AND/OR/NOT + parentheses, e.g. "(upload or download) and not deprecated". No schema change.
 # v4.3: (a) the vector index is built AND refreshed in bounded-memory STREAMING waves (read item ids, then
 # fetch->chunk->embed->insert one wave at a time), and incremental_sync upserts its delta wave-by-wave too,
 # so peak memory stays small no matter the project size; (b) search/semantic/query are OFFLINE-FIRST &
@@ -1654,7 +1654,7 @@ def _semantic_ids(proj_id, query, max_distance=VEC_MAX_DISTANCE):
 
 # ============================ boolean keyword expressions (search --expr / --keyword) ============================
 # A tiny boolean mini-language over keywords for `search`: AND / OR / NOT + parentheses, e.g.
-#   (dock or cradle) and (charge or power) and not legacy
+#   (upload or download) and (encrypt or compress) and not deprecated
 # Operators are case-insensitive words (and/or/not) OR symbols (& && | || !); full-width parens （） are
 # accepted; commas separate terms. Adjacent terms with no operator mean AND ("answer call" in quotes is
 # ONE phrase term). The SAME parsed AST drives the FTS5 leg (native AND/OR/NOT) and the LIKE leg (nested
@@ -2281,7 +2281,7 @@ def cmd_search(a):
         try:
             ast = parse_bool_expr(expr)
         except ValueError as e:
-            sys.exit(f'Could not parse --expr "{expr}": {e}.  Example: "(dock or cradle) and not legacy".')
+            sys.exit(f'Could not parse --expr "{expr}": {e}.  Example: "(upload or download) and not deprecated".')
     else:
         if not keywords and a.query:
             keywords = keywords_of(a.query)  # feed the FTS/LIKE legs from the query words too (as before)
@@ -2328,7 +2328,7 @@ def cmd_query(a):
 def cmd_semantic(a):
     q = " ".join(a.query) if a.query else None
     if not q:
-        sys.exit('semantic needs --query "natural language text", e.g. --query "headset won\'t charge on the cradle"')
+        sys.exit('semantic needs --query "natural language text", e.g. --query "user can\'t upload a large file"')
     md = a.max_distance if a.max_distance is not None else VEC_MAX_DISTANCE
     dates = norm_dates(a)  # optional created/modified range filter
     pr = single_project(a.project)
@@ -2434,7 +2434,7 @@ def build_parser():
             sp.add_argument("--keyword", action="append", help="keyword(s), comma-separated")
             sp.add_argument("--expr", action="append",
                             help='boolean keyword expression for the FTS+LIKE legs: AND/OR/NOT + parentheses,'
-                                 ' e.g. "(dock or cradle) and (charge or power) and not legacy"')
+                                 ' e.g. "(upload or download) and (encrypt or compress) and not deprecated"')
             sp.add_argument("--query", action="append", help="natural-language text (drives the vector leg)")
             sp.add_argument("--match", choices=["any", "all"], default="any")
             sp.add_argument("--field", choices=["name", "all"], default="all")

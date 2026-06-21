@@ -11,7 +11,7 @@ only vector search needs `fastembed` + `sqlite-vec` (auto-installed on first use
 - 🔎 **Hybrid search** — FTS5/BM25 + substring (LIKE) + semantic (vector),
   fused by Reciprocal Rank Fusion (RRF) and de-duplicated. All three legs cover
   an item's **name, description, and test-case steps**.
-- 🧮 **Boolean expressions** — `--expr "(dock or cradle) and (charge or power) and not legacy"`
+- 🧮 **Boolean expressions** — `--expr "(upload or download) and (encrypt or compress) and not deprecated"`
   (AND/OR/NOT + parentheses; full-width `（）` and symbol operators accepted) drives
   the keyword + substring legs precisely.
 - 📅 **Date-range filters** — `--created-after/-before` and `--modified-after/-before`
@@ -53,14 +53,14 @@ python jama_offline.py projects --project projecta
 python jama_offline.py init --project 12345
 
 # 4. Hybrid search (keyword + substring + semantic)
-python jama_offline.py search --project 12345 --keyword docking --type REQ
+python jama_offline.py search --project 12345 --keyword upload --type REQ
 
 # 4b. Boolean expression + date range
 python jama_offline.py search --project 12345 \
-    --expr "(dock or cradle) and not legacy" --created-after 2026-01-01
+    --expr "(upload or download) and not deprecated" --created-after 2026-01-01
 
 # 5. Semantic search (meaning-based)
-python jama_offline.py semantic --project 12345 --query "headset won't charge"
+python jama_offline.py semantic --project 12345 --query "user can't upload a large file"
 
 # 6. SQL query for exact stats
 python jama_offline.py query --project 12345 \

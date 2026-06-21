@@ -31,8 +31,8 @@ One script: **`jama_offline.py`** (commands: `projects, init, update, sync, rebu
 python "SKILL_DIR/jama_offline.py" login --base https://example.jamacloud.com --client-id <ID> --client-secret <SECRET>  # once
 python "SKILL_DIR/jama_offline.py" projects --project projecta
 python "SKILL_DIR/jama_offline.py" init     --project 12345                     # ONE-TIME: full download + vector index (~30-50 min)
-python "SKILL_DIR/jama_offline.py" search   --project 12345 --keyword docking --type REQ
-python "SKILL_DIR/jama_offline.py" semantic --project 12345 --query "headset won't charge on the cradle"
+python "SKILL_DIR/jama_offline.py" search   --project 12345 --keyword upload --type REQ
+python "SKILL_DIR/jama_offline.py" semantic --project 12345 --query "user can't upload a large file"
 python "SKILL_DIR/jama_offline.py" query    --project 12345 --sql "SELECT typeKey, COUNT(*) c FROM items GROUP BY typeKey"
 python "SKILL_DIR/jama_offline.py" update   --project 12345                     # when a query says the cache drifted
 ```
@@ -97,7 +97,7 @@ measurement** tool. Either is allowed for any goal — just know the trade-off:
 - **Exact numbers** (counts, group-by, %, exact-condition sets) → **`query` (SQL)** is the reliable choice:
   exact, reproducible, auditable. A fused hit-count is an incidental UNION (FTS ∪ LIKE ∪ vector) that moves
   with `--max-distance` / wording, so don't present it as a precise population total. E.g.
-  `query --sql "SELECT typeKey, COUNT(*) c FROM items WHERE name LIKE '%dock%' GROUP BY typeKey"`.
+  `query --sql "SELECT typeKey, COUNT(*) c FROM items WHERE name LIKE '%upload%' GROUP BY typeKey"`.
 - **Semantic "how many about X"** → `semantic`/`search` is the only way (SQL can't judge meaning). Report
   the count as **approximate** and state the `--max-distance` used; tighten/loosen it to see how it shifts.
 - **Combine both:** `search`/`semantic` to discover the relevant `typeKey`s / terms / subtrees → then
@@ -162,7 +162,7 @@ items**, it STOPS with the exact `init`/`update` command to run. Add **`--offlin
 entirely and use the existing cache as-is (no credentials; for no-signal/air-gapped use; errors if a needed
 file is missing). Add **`--force`** to override the gate and rebuild on the spot.
 
-Options use `--flag value`. Lists are comma-separated: `--keyword dock,cradle`, `--type REQ,FEAT`.
+Options use `--flag value`. Lists are comma-separated: `--keyword upload,download`, `--type REQ,FEAT`.
 
 ---
 
@@ -172,10 +172,10 @@ Options use `--flag value`. Lists are comma-separated: `--keyword dock,cradle`, 
 output is **uncapped by default** (`--top N` to limit), but each leg feeds a bounded candidate set in:
 All three legs search an item's **name + description + test-case steps** (the authored `testCaseSteps`,
 i.e. action / expectedResult / notes).
-- **keyword (FTS5/BM25)** — ranked, stemmed (`dock` matches `docking`/`docked`). **Top ~200 by relevance**
+- **keyword (FTS5/BM25)** — ranked, stemmed (`upload` matches `uploading`/`uploaded`). **Top ~200 by relevance**
   (a multi-word OR can BM25-match 40–70% of the corpus; the tail is noise). To enumerate EVERY item
   containing a term, that's a counting/exact-set job → use **`query`** (`WHERE name LIKE '%x%'`), not search.
-- **substring (LIKE)** — partial words / codes / fragments stemming misses (`undock`, `$89009`). **Up to ~200**, in document order.
+- **substring (LIKE)** — partial words / codes / fragments stemming misses (`reupload`, `$12345`). **Up to ~200**, in document order.
 - **semantic (vector)** — meaning/paraphrase matches sharing no literal words. The index is **chunked**:
   each item's full text (name + description + steps) is embedded in overlapping windows (no truncation),
   so a long test case is searchable end to end; chunk hits fold back to one row per item. Only items with
@@ -185,7 +185,7 @@ Rules:
 - `--keyword a,b` (comma = OR; `--match all` = AND) and/or `--query "natural language"` (drives the vector
   leg). At least one is required; give `--query` for fuzzy intent, `--keyword` for specific terms.
 - **Boolean expressions — `--expr "…"`** for AND/OR/NOT + parentheses, e.g.
-  `--expr "(dock or cradle) and (charge or power) and not legacy"`. Operators are case-insensitive words
+  `--expr "(upload or download) and (encrypt or compress) and not deprecated"`. Operators are case-insensitive words
   (`and`/`or`/`not`) or symbols (`&`/`|`/`!`); full-width `（）` are accepted; adjacent terms = AND; quote a
   phrase (`"answer call"`). The expression drives the **keyword (FTS) + substring (LIKE)** legs exactly; the
   vector leg still runs on `--query` (or the expression's positive terms) for meaning-based recall. (A
@@ -198,11 +198,11 @@ Rules:
   vector threshold (default 0.30; lower = stricter, e.g. `0.20`; higher = looser). Output: `score via name`.
 
 ```bash
-python "SKILL_DIR/jama_offline.py" search --project 12345 --keyword docking --type REQ
-python "SKILL_DIR/jama_offline.py" search --project 12345 --query "headset won't charge on the cradle"
-python "SKILL_DIR/jama_offline.py" search --project 12345 --expr "(dock or cradle) and not legacy" --type REQ
-python "SKILL_DIR/jama_offline.py" search --project 12345 --keyword battery --created-after 2026-01-01 --created-before 2026-06-30
-python "SKILL_DIR/jama_offline.py" search --project 12345 --keyword mute --max-distance 0.25 --top 50
+python "SKILL_DIR/jama_offline.py" search --project 12345 --keyword upload --type REQ
+python "SKILL_DIR/jama_offline.py" search --project 12345 --query "user can't upload a large file"
+python "SKILL_DIR/jama_offline.py" search --project 12345 --expr "(upload or download) and not deprecated" --type REQ
+python "SKILL_DIR/jama_offline.py" search --project 12345 --keyword report --created-after 2026-01-01 --created-before 2026-06-30
+python "SKILL_DIR/jama_offline.py" search --project 12345 --keyword export --max-distance 0.25 --top 50
 ```
 Output columns: `id  documentKey  typeKey  sequence  name`. Report `documentKey` + `name` to the user.
 
@@ -238,13 +238,13 @@ python "SKILL_DIR/jama_offline.py" query --project 12345 --sql "SELECT key, valu
 ## `semantic` — meaning-based (vector) search
 
 Finds items by **meaning**, not literal words — catches paraphrases/synonyms that FTS misses (e.g.
-"won't charge on the cradle" → docking-power requirements that never say "charge").
+"can't upload a large file" → file-size-limit requirements that never say "upload").
 
 ```bash
-python "SKILL_DIR/jama_offline.py" semantic --project 12345 --query "headset won't charge on the cradle"
-python "SKILL_DIR/jama_offline.py" semantic --project 12345 --query "noise cancellation on calls" --type REQ
-python "SKILL_DIR/jama_offline.py" semantic --project 12345 --query "battery life" --max-distance 0.45  # looser
-python "SKILL_DIR/jama_offline.py" semantic --project 12345 --query "battery life" --modified-after 2026-01-01
+python "SKILL_DIR/jama_offline.py" semantic --project 12345 --query "user can't upload a large file"
+python "SKILL_DIR/jama_offline.py" semantic --project 12345 --query "two-factor authentication" --type REQ
+python "SKILL_DIR/jama_offline.py" semantic --project 12345 --query "session timeout" --max-distance 0.45  # looser
+python "SKILL_DIR/jama_offline.py" semantic --project 12345 --query "session timeout" --modified-after 2026-01-01
 ```
 `semantic` also accepts the same `--created-after/-before` and `--modified-after/-before` date filters as `search`.
 Output columns: `id  documentKey  typeKey  sequence  score  name` (score = cosine similarity 0–1).
@@ -343,9 +343,9 @@ Cache (`jama-proj-<id>.db`) — SQLite, every field flattened (no JSON blob):
   action / expectedResult / notes; per-run `testRunSteps` are NOT included). `statusName`/`priorityName`
   = labels resolved from the numeric `status`/`priority` ids.
 - **`fields_kv(itemId, key, value)`** — EVERY `fields.*` entry as text, incl. custom per-type keys like
-  `verifying_teams_new$89009`, `testRunSteps`. (Raw HTML of `description` is not duplicated here.)
+  `my_custom_field$12345`, `testRunSteps`. (Raw HTML of `description` is not duplicated here.)
 - **`fts`** — FTS5 external-content index over `items.name` + `items.description` + `items.stepsText`
-  (rowid = item id), used by `search`. Query: `SELECT rowid FROM fts WHERE fts MATCH 'docking' ORDER BY bm25(fts)`.
+  (rowid = item id), used by `search`. Query: `SELECT rowid FROM fts WHERE fts MATCH 'upload' ORDER BY bm25(fts)`.
 - **`picklist(id, name, pickList)`** — id→label map (status/priority and any other option ids).
 - **`relationships(...)`** — only when synced with `--with-links` (traceability is OFF by default).
 - **`meta(key, value)`** — `last_sync_at`, `watermark` (= newest `modifiedDate` captured; the incremental
